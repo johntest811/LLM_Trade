@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070b12">
+  <title>LLM Trading Terminal</title>
+  <link rel="stylesheet" href="/static/terminal.css?v=20260720-1">
+  <script src="/static/terminal.js?v=20260804-1" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to trading workspace</a>
+
+  <div class="app-shell">
+    <header class="command-bar">
+      <div class="brand-lockup" aria-label="LLM Trading Terminal">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <div class="brand-name">LLM Trading Terminal</div>
+          <div class="brand-tagline">Deterministic decisions · optional model assistance</div>
+        </div>
+      </div>
+
+      <div class="account-identity" aria-live="polite">
+        <span id="account-mode-chip" class="mode-chip unknown">UNKNOWN</span>
+        <span id="account-identity-text">Waiting for Pepperstone MT5</span>
+      </div>
+
+      <div class="status-cluster" aria-label="Terminal status">
+        <span id="s-ws" class="status-chip offline" role="status"><i></i><span>CONNECTING</span></span>
+        <span id="s-account" class="status-chip neutral"><i></i><span>ACCOUNT</span></span>
+        <span id="s-llm" class="status-chip neutral"><i></i><span>DECISION</span></span>
+        <span id="s-lock" class="status-chip warning"><i></i><span>DISARMED</span></span>
+      </div>
+
+      <div class="command-actions">
+        <button id="engine-btn" class="button secondary" type="button">Start engine</button>
+        <button id="arm-btn" class="button primary" type="button">Arm entries</button>
+        <button id="autonomy-btn" class="button secondary" type="button">Autonomy off</button>
+        <button id="settings-btn" class="button icon-button" type="button" aria-label="Open terminal settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 9 19.37a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15a1.7 1.7 0 0 0-1.55-1.03H3v-4h.08A1.7 1.7 0 0 0 4.63 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63a1.7 1.7 0 0 0 1.03-1.55V3h4v.08A1.7 1.7 0 0 0 15 4.63a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9a1.7 1.7 0 0 0 1.55 1.03H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="live-banner" class="live-banner" role="status" hidden>
+      <strong>LIVE ACCOUNT</strong>
+      <span>Orders can use real funds. Autonomous authorization, when enabled, remains bound to this exact MT5 account.</span>
+    </div>
+
+    <main id="main-content" tabindex="-1">
+      <section id="risk-banner" class="alert-banner" role="alert" hidden>
+        <span class="alert-icon" aria-hidden="true">!</span>
+        <div><strong id="risk-banner-title">Execution blocked</strong><span id="risk-banner-text"></span></div>
+      </section>
+
+      <section class="overview-grid" aria-label="Account overview">
+        <article class="metric-card metric-primary">
+          <div class="metric-heading"><span>Equity</span><span id="equity-delta" class="metric-badge">LIVE</span></div>
+          <div id="m-equity" class="metric-value">—</div>
+          <div id="m-floating" class="metric-detail">Open P/L —</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-heading"><span>Balance</span><span>Account</span></div>
+          <div id="m-balance" class="metric-value">—</div>
+          <div id="m-mode" class="metric-detail">Waiting for MT5</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-heading"><span>Today</span><span id="m-record">0 trades</span></div>
+          <div id="m-day" class="metric-value">—</div>
+          <div class="metric-detail">Realized + floating P/L</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-heading"><span>Stop risk</span><span id="risk-limit-label">of cap</span></div>
+          <div id="m-risk" class="metric-value">—</div>
+          <div id="m-risk-usd" class="metric-detail">—</div>
+          <div id="risk-progress" class="progress risk" role="progressbar" aria-label="Portfolio stop risk" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-heading"><span>Margin use</span><span id="margin-limit-label">of cap</span></div>
+          <div id="m-margin" class="metric-value">—</div>
+          <div id="m-margin-level" class="metric-detail">Margin level —</div>
+          <div id="margin-progress" class="progress margin" role="progressbar" aria-label="Margin use" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-heading"><span>Maximum loss / order</span><span id="capital-fit-summary">Assessing</span></div>
+          <div id="r-budget" class="metric-value">—</div>
+          <div id="budget-detail" class="metric-detail">Execution ceiling only; excluded from market ranking</div>
+        </article>
+      </section>
+
+      <div class="workspace-grid">
+        <div class="primary-column">
+          <section class="panel positions-panel" aria-labelledby="positions-title">
+            <header class="panel-header">
+              <div>
+                <p class="eyebrow">Portfolio</p>
+                <h1 id="positions-title">Open positions</h1>
+              </div>
+              <span id="position-count" class="panel-count">0 ACTIVE</span>
+            </header>
+            <div class="table-scroll">
+              <table class="data-table positions-table">
+                <caption class="sr-only">Open Pepperstone MT5 positions</caption>
+                <thead><tr><th scope="col">Market</th><th scope="col">Side</th><th scope="col">Size</th><th scope="col">Open / current</th><th scope="col">SL / TP</th><th scope="col">P/L</th><th scope="col">Stop risk</th><th scope="col">Plan</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                <tbody id="positions"><tr><td colspan="9" class="empty-state">No open positions</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel pipeline-panel" aria-labelledby="pipeline-title">
+            <header class="panel-header pipeline-header">
+              <div>
+                <p class="eyebrow">Automation timeline</p>
+                <h2 id="pipeline-title">M5 decision pipeline</h2>
+              </div>
+              <div class="scan-clock" aria-label="Time to next M5 candle close">
+                <div id="scan-ring" class="scan-ring" style="--scan-progress:0%"><span id="scan-countdown">--:--</span></div>
+                <div><strong>Next M5 close</strong><span id="server-clock">Server clock —</span></div>
+              </div>
+            </header>
+            <div class="pipeline-summary-row">
+              <span id="pipeline-summary">Waiting for symbol state</span>
+              <span id="payload-sequence">Sequence —</span>
+            </div>
+            <div id="symbol-pipeline" class="symbol-pipeline" aria-live="polite">
+              <div class="empty-card">Waiting for the first engine snapshot.</div>
+            </div>
+          </section>
+
+          <section class="panel market-panel" aria-labelledby="market-title">
+            <header class="panel-header">
+              <div>
+                <p class="eyebrow">Pepperstone stream</p>
+                <h2 id="market-title">Market Watch</h2>
+              </div>
+              <span id="watch-count" class="panel-count">WAITING FOR PRICES</span>
+            </header>
+            <div class="quote-convention">
+              <span class="convention-swatch sell"></span><strong>Red SELL display</strong>
+              <span class="convention-swatch buy"></span><strong>Blue BUY display</strong>
+              <span>Execution remains standard: orders buy at ASK and sell at BID.</span>
+            </div>
+            <div id="watch" class="market-watch"><div class="empty-card">Waiting for live quotes.</div></div>
+          </section>
+
+          <section class="panel activity-panel" aria-labelledby="activity-title">
+            <header class="panel-header">
+              <div class="tabs" role="tablist" aria-label="Trading activity">
+                <button id="history-tab-button" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="history-tab" data-tab="history">Trade history</button>
+                <button id="logs-tab-button" class="tab" type="button" role="tab" aria-selected="false" aria-controls="logs-tab" data-tab="logs" tabindex="-1">System log</button>
+              </div>
+              <span id="history-count" class="panel-count">0 RECENT</span>
+            </header>
+            <div id="history-tab" role="tabpanel" aria-labelledby="history-tab-button">
+              <div class="table-scroll">
+                <table class="data-table history-table">
+                  <caption class="sr-only">Recent reconciled trading history</caption>
+                  <thead><tr><th scope="col">Closed</th><th scope="col">Market</th><th scope="col">Side</th><th scope="col">Size</th><th scope="col">Open / close</th><th scope="col">Net P/L</th><th scope="col">MFE / MAE</th><th scope="col">Exit</th></tr></thead>
+                  <tbody id="history"><tr><td colspan="8" class="empty-state">No reconciled bot trades yet</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+            <div id="logs-tab" class="system-log" role="tabpanel" aria-labelledby="logs-tab-button" tabindex="0" hidden></div>
+          </section>
+        </div>
+
+        <aside class="side-column" aria-label="Decision and risk controls">
+          <section id="readiness" class="panel readiness-panel" aria-labelledby="readiness-title">
+            <header class="panel-header">
+              <div><p class="eyebrow">Broker channel</p><h2 id="readiness-title">Execution readiness</h2></div>
+              <span id="safety-state" class="state-badge blocked">BLOCKED</span>
+            </header>
+            <div class="panel-body">
+              <div class="readiness-hero">
+                <div class="readiness-orb" aria-hidden="true"><span></span></div>
+                <div><strong id="ready-state">BLOCKED</strong><p id="ready-reason">Waiting for the engine snapshot.</p></div>
+              </div>
+              <ul id="readiness-checks" class="check-list"><li class="pending"><i>·</i><span>Loading readiness checks</span></li></ul>
+              <p id="safety-reason" class="context-note">New entries are disarmed after startup.</p>
+              <dl class="rule-grid">
+                <div><dt>Entry risk cap</dt><dd id="r-trade">—</dd></div>
+                <div><dt>Portfolio cap</dt><dd id="r-portfolio">—</dd></div>
+                <div><dt>Minimum R:R</dt><dd id="r-rr">—</dd></div>
+                <div><dt>Margin cap</dt><dd id="r-margin">—</dd></div>
+                <div class="wide"><dt>History sync</dt><dd id="r-sync">—</dd></div>
+              </dl>
+            </div>
+          </section>
+
+          <section class="panel decision-panel" aria-labelledby="decision-title">
+            <header class="panel-header">
+              <div><p class="eyebrow">Latest decision output</p><h2 id="decision-title">Decision detail</h2></div>
+              <time id="llm-time">—</time>
+            </header>
+            <div class="panel-body">
+              <div class="decision-heading">
+                <div><span id="decision-symbol" class="decision-symbol">—</span><strong id="decision-action" class="decision-action neutral">—</strong></div>
+                <span id="decision-confidence" class="confidence-value">0%</span>
+              </div>
+              <div id="confidence-track" class="confidence-track" role="progressbar" aria-label="Decision confidence" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <i id="confidence-bar"></i><b id="confidence-threshold-marker" style="left:70%"><span>Gate 70%</span></b>
+              </div>
+              <p class="confidence-disclaimer">Decision confidence is an evidence gate, not an estimated win probability.</p>
+              <dl class="detail-list">
+                <div><dt>Decision time</dt><dd id="decision-latency">—</dd></div>
+                <div><dt>Provider</dt><dd id="decision-model">—</dd></div>
+                <div><dt>Scan trigger</dt><dd id="scan-timeframe">M5 close</dd></div>
+                <div><dt>Confirmation</dt><dd id="scan-confirmation">M15 / H1 / H4</dd></div>
+                <div><dt>Scan status</dt><dd id="scan-status">NOT STARTED</dd></div>
+                <div><dt>Last scan</dt><dd id="last-scan">—</dd></div>
+              </dl>
+              <div id="decision-reason" class="decision-reason">Waiting for a completed candle.</div>
+            </div>
+          </section>
+
+          <section class="panel capital-panel" aria-labelledby="capital-title">
+            <header class="panel-header">
+              <div><p class="eyebrow">Minimum-volume feasibility</p><h2 id="capital-title">Capital fit</h2></div>
+              <span id="market-fit-count" class="panel-count">ASSESSING</span>
+            </header>
+            <p id="shadow-summary" class="context-note">Rejected-signal evidence is initializing.</p>
+            <div id="capital-fit-grid" class="capital-fit-grid"><div class="empty-card">Capital diagnostics appear after M5 analysis.</div></div>
+          </section>
+
+          <section class="panel evidence-panel" aria-labelledby="evidence-title">
+            <header class="panel-header">
+              <div><p class="eyebrow">Closed-trade evidence</p><h2 id="evidence-title">Strategy performance</h2></div>
+              <span id="evidence-status" class="state-badge warning">UNVALIDATED</span>
+            </header>
+            <div class="panel-body">
+              <div class="evidence-grid">
+                <div class="evidence-item"><span>Profit factor</span><strong id="evidence-profit-factor">—</strong></div>
+                <div class="evidence-item"><span>Expectancy / trade</span><strong id="evidence-expectancy">—</strong></div>
+                <div class="evidence-item"><span>Max closed drawdown</span><strong id="evidence-drawdown">—</strong></div>
+                <div class="evidence-item"><span>Closed sample</span><strong id="evidence-sample">0 trades</strong></div>
+              </div>
+              <div id="evidence-note" class="validation-note"><span class="state-badge">UNVALIDATED</span><span>Fewer than 30 closed trades. These statistics are descriptive evidence, not a profit forecast.</span></div>
+            </div>
+          </section>
+
+          <details class="panel diagnostics-panel">
+            <summary><span><span class="eyebrow">Local inference host</span><strong>System diagnostics</strong></span><span id="diagnostics-summary">—</span></summary>
+            <div class="diagnostics-body">
+              <div class="gauge-row"><div><span>CPU</span><strong id="sys-cpu">—</strong></div><div id="cpu-progress" class="gauge" role="progressbar" aria-label="CPU usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div></div>
+              <div class="gauge-row"><div><span>GPU Performance</span><strong id="sys-gpu">—</strong></div><div id="gpu-progress" class="gauge gpu" role="progressbar" aria-label="GPU usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div></div>
+              <div class="gauge-row"><div><span>VRAM Usage</span><strong id="sys-vram">—</strong></div><div id="vram-progress" class="gauge vram" role="progressbar" aria-label="VRAM usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div></div>
+              <div class="gauge-row"><div><span>Memory</span><strong id="sys-ram">—</strong></div><div id="ram-progress" class="gauge memory" role="progressbar" aria-label="System memory usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i></i></div></div>
+            </div>
+          </details>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="trade-dialog" class="modal" aria-labelledby="trade-title">
+    <form id="trade-form" novalidate>
+      <header class="modal-header"><div><p class="eyebrow">Position control</p><h2 id="trade-title">Manage position</h2></div><button class="button icon-button modal-close" type="button" data-close-dialog="trade-dialog" aria-label="Close position manager">×</button></header>
+      <div class="modal-body">
+        <input id="trade-ticket" type="hidden">
+        <div id="trade-context" class="trade-context"></div>
+        <fieldset><legend>Protection</legend><div class="form-grid two"><div class="field"><label for="trade-sl">Stop loss price</label><input id="trade-sl" type="number" inputmode="decimal" step="any" min="0"><small id="trade-sl-estimate" class="exit-estimate muted">Estimated exit P/L —</small><small>Price level; leave empty to keep the current value.</small></div><div class="field"><label for="trade-tp">Take profit price</label><input id="trade-tp" type="number" inputmode="decimal" step="any" min="0"><small id="trade-tp-estimate" class="exit-estimate muted">Estimated exit P/L —</small><small>Price level; leave empty to keep the current value.</small></div></div><p class="protection-estimate-note">Dollar estimates use the current MT5 position values before future swap, fees, and slippage.</p><button id="protect-btn" class="button secondary" type="button">Update SL / TP</button></fieldset>
+        <fieldset><legend>Close position</legend><div class="field"><label for="close-percent">Percentage to close</label><input id="close-percent" type="number" inputmode="decimal" min="1" max="100" value="100" required><small>A live close is irreversible and requires typed confirmation.</small></div></fieldset>
+      </div>
+      <footer class="modal-footer"><button class="button secondary" type="button" data-close-dialog="trade-dialog">Cancel</button><button id="close-trade-btn" class="button danger" type="button">Submit close</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="rejected-dialog" class="modal rejected-modal" aria-labelledby="rejected-title">
+    <form id="rejected-form">
+      <header class="modal-header"><div><p class="eyebrow">Operator force order</p><h2 id="rejected-title">Review rejected trade</h2></div><button class="button icon-button modal-close" type="button" data-close-dialog="rejected-dialog" aria-label="Close rejected trade review">×</button></header>
+      <div class="modal-body">
+        <div class="override-warning"><strong>Original rejection</strong><span id="rejected-reason">—</span></div>
+        <dl class="override-grid">
+          <div><dt>Order</dt><dd id="rejected-order">—</dd></div>
+          <div><dt>Current entry</dt><dd id="rejected-entry">—</dd></div>
+          <div><dt>Stop loss</dt><dd id="rejected-sl">—</dd></div>
+          <div><dt>Take profit</dt><dd id="rejected-tp">—</dd></div>
+          <div><dt>Stop risk</dt><dd id="rejected-risk">—</dd></div>
+          <div><dt>Balance at risk / ceiling</dt><dd id="rejected-risk-cap">—</dd></div>
+          <div><dt>Target reward</dt><dd id="rejected-reward">—</dd></div>
+          <div><dt>Net R:R</dt><dd id="rejected-rr">—</dd></div>
+          <div><dt>Projected margin</dt><dd id="rejected-margin">—</dd></div>
+        </dl>
+        <div class="override-safety"><strong>Project protections bypassed</strong><span>This force order bypasses confidence, ADX/trend, spread, R:R, daily-loss, drawdown, cooldown, position-count, duplicate-position, portfolio-risk, and configured margin limits. It uses the broker minimum volume. A current signal, valid SL/TP, fresh quote, verified account permissions, sufficient Pepperstone margin, and MT5 order approval are still mandatory. Automatic trading remains unchanged.</span></div>
+      </div>
+      <footer class="modal-footer"><button class="button secondary" type="button" data-close-dialog="rejected-dialog">Cancel</button><button id="open-rejected-btn" class="button danger" type="submit">Force open at broker minimum</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="modal settings-modal" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <header class="modal-header"><div><p class="eyebrow">Configuration</p><h2 id="settings-title">Terminal settings</h2></div><button class="button icon-button modal-close" type="button" data-close-dialog="settings-dialog" aria-label="Close settings">×</button></header>
+      <div class="modal-body settings-body">
+        <section class="settings-section" id="local-model-profile">
+          <h3>Local Qwen profile</h3>
+          <div class="form-grid two">
+            <div class="field">
+              <label for="c-quantization">Quantization profile</label>
+              <select id="c-quantization">
+                <option value="AUTO">Follow LM Studio · Q6_K / Q8_0</option>
+                <option value="Q6_K">Q6_K · recommended · faster</option>
+                <option value="Q8_0">Q8_0 · larger · slower</option>
+              </select>
+              <small id="c-quantization-hint">Follow mode accepts either supported loaded variant automatically.</small>
+            </div>
+            <div class="field">
+              <label>Concurrency profile</label>
+              <div class="readonly-value" id="c-concurrency-profile">2 predictions · Q6_K</div>
+              <small>Follow mode and Q8_0 use one project prediction to remain compatible during a live switch.</small>
+            </div>
+          </div>
+          <p class="section-help">Follow mode lets LM Studio switch between the installed Q6_K and Q8_0 variants without another project configuration change. Pin a profile only when you want strict enforcement. Unsupported quantizations remain fail-closed.</p>
+        </section>
+        <section class="settings-section"><h3>Markets & decision service</h3><div class="field"><label for="c-symbols">Core weekday symbols</label><input id="c-symbols" autocomplete="off" required><small>Always included in the bounded Pepperstone candidate universe.</small></div><div class="field"><label for="c-candidates">Adaptive market candidates</label><input id="c-candidates" autocomplete="off" required><small>Broker availability, capital fit, spread, ADX, risk and margin determine the active selection.</small></div><div class="form-grid two"><div class="field"><label for="c-dynamic-markets">Adaptive selection</label><select id="c-dynamic-markets"><option value="true">Enabled · recommended</option><option value="false">Disabled · core symbols only</option></select></div><div class="field"><label for="c-market-max">Maximum active markets</label><input id="c-market-max" type="number" min="1" max="12" required></div><div class="field"><label for="c-market-refresh">Market ranking refresh</label><div class="input-unit"><input id="c-market-refresh" type="number" min="30" max="3600" required><span>seconds</span></div></div><div class="field"><label for="c-analysis">Candle polling interval</label><div class="input-unit"><input id="c-analysis" type="number" min="15" max="300" required><span>seconds</span></div></div><div class="field"><label for="c-provider">Decision provider</label><select id="c-provider"><option value="deterministic">Deterministic · no LLM</option><option value="local">Local · LM Studio</option><option value="openai">OpenAI · Responses API</option></select></div><div class="field"><label for="c-model">Decision model</label><input id="c-model" autocomplete="off" required><small id="c-provider-hint">Deterministic rules use completed-candle evidence with no API or model delay.</small></div><div class="field"><label for="c-reasoning">OpenAI reasoning</label><select id="c-reasoning"><option value="none">None · fastest</option><option value="low">Low · recommended for M5</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option></select></div></div><div class="field"><label for="c-timeframe">Decision trigger</label><select id="c-timeframe" disabled><option>M5 close · adaptive continuation / pullback / reversal · M15 / H1 / H4 confirmation</option></select></div></section>
+        <section class="settings-section">
+          <h3>Risk envelope</h3>
+          <div class="form-grid two">
+            <div class="field"><label for="c-risk">Risk per trade</label><div class="input-unit"><input id="c-risk" type="number" min="0.05" max="20" step="0.05" required><span>%</span></div></div>
+            <div class="field"><label for="c-portfolio">Portfolio stop risk</label><div class="input-unit"><input id="c-portfolio" type="number" min="0.1" max="20" step="0.1" required><span>%</span></div></div>
+            <div class="field"><label for="c-maxpos">Maximum positions</label><input id="c-maxpos" type="number" min="1" max="10" required></div>
+            <div class="field"><label for="c-margin">Maximum margin use</label><div class="input-unit"><input id="c-margin" type="number" min="5" max="90" required><span>%</span></div></div>
+            <div class="field"><label for="c-rr">Minimum R:R</label><input id="c-rr" type="number" min="1" max="10" step="0.1" required></div>
+            <div class="field"><label for="c-confidence">Confidence gate</label><input id="c-confidence" type="number" min="0.5" max="0.99" step="0.01" required><small>0.70 equals 70% model confidence.</small></div>
+            <div class="field"><label for="c-spread">Maximum spread</label><input id="c-spread" type="number" min="0.1" max="1000" step="0.1" required><small>Applied in the configured symbol's spread unit.</small></div>
+            <div class="field"><label for="c-entry-adx">Minimum entry ADX</label><input id="c-entry-adx" type="number" min="15" max="60" step="0.5" required><small>Fresh M5 momentum required for new entries.</small></div>
+            <div class="field"><label for="c-adx-rising">Require rising ADX</label><select id="c-adx-rising"><option value="true">Yes</option><option value="false">No</option></select></div>
+            <div class="field"><label for="c-adx-decline">ADX decline tolerance</label><div class="input-unit"><input id="c-adx-decline" type="number" min="0" max="5" step="0.05" required><span>points</span></div><small>Small bar-to-bar ADX noise below this amount is allowed.</small></div>
+            <div class="field"><label for="c-breakout-displacement">Breakout displacement</label><div class="input-unit"><input id="c-breakout-displacement" type="number" min="0" max="1" step="0.01" required><span>ATR</span></div><small>Rejects tiny level breaches that are more likely to reverse than continue.</small></div>
+            <div class="field"><label for="c-zone-distance">Opposing-zone distance</label><div class="input-unit"><input id="c-zone-distance" type="number" min="0" max="5" step="0.05" required><span>ATR</span></div></div>
+            <div class="field"><label for="c-cost-extension">Cost-aware TP extension</label><div class="input-unit"><input id="c-cost-extension" type="number" min="0" max="2" step="0.05" required><span>R</span></div><small>Bounded extension used only to preserve net R:R after execution reserves.</small></div>
+            <div class="field"><label for="c-reentry-bars">Same-thesis re-entry</label><div class="input-unit"><input id="c-reentry-bars" type="number" min="1" max="24" step="1" required><span>M5 bars</span></div></div>
+            <div class="field"><label for="c-retest">Pullback-resumption entries</label><select id="c-retest"><option value="true">Enabled · verified retest only</option><option value="false">Disabled</option></select><small>Allows one fresh entry candle when an aligned M5 pullback returns to the confirmed trend.</small></div>
+            <div class="field"><label for="c-retest-min">Minimum retest resumption</label><div class="input-unit"><input id="c-retest-min" type="number" min="0.01" max="1.5" step="0.01" required><span>ATR</span></div></div>
+            <div class="field"><label for="c-micro-profit">+$0.20 peak protection</label><select id="c-micro-profit"><option value="false">Off · default</option><option value="true">On · protect small gains</option></select><small>Enables the configured USD peak/floor paths without changing the broker take-profit.</small></div>
+            <div class="field"><label for="c-shadow-symbols">Shadow symbols</label><input id="c-shadow-symbols" type="text" placeholder="USDCAD"><small>Signals remain visible but no automatic order is sent.</small></div>
+          </div>
+        </section>
+        <section class="settings-section"><h3>Profit & loss objectives</h3><p class="section-help">Objectives filter or close positions. They never justify a larger entry risk or stretched take-profit.</p><div class="form-grid two"><div class="field"><label for="c-profit-on">Profit close</label><select id="c-profit-on"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-profit">Profit objective</label><div class="input-unit"><input id="c-profit" type="number" min="0.01" step="0.01"><span>USD</span></div></div><div class="field"><label for="c-loss-on">Loss close</label><select id="c-loss-on"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-loss">Maximum loss</label><div class="input-unit"><input id="c-loss" type="number" min="0.01" step="0.01"><span>USD</span></div></div></div></section>
+        <section class="settings-section"><h3>Professional position monitoring</h3><p class="section-help">Entry signals remain completed-M5 decisions. Open positions receive faster deterministic protection and completed-M1 exit reviews. Profit protection is triggered by each trade's immutable initial risk (R), so it scales across markets.</p><div class="form-grid two"><div class="field"><label for="c-monitor-poll">Protection polling</label><div class="input-unit"><input id="c-monitor-poll" type="number" min="0.5" max="5" step="0.1" required><span>seconds</span></div></div><div class="field"><label for="c-fast-exit">Fast model exit review</label><select id="c-fast-exit"><option value="true">Enabled · M1</option><option value="false">Disabled · M5 only</option></select></div><div class="field"><label for="c-exit-timeframe">Exit evidence</label><select id="c-exit-timeframe"><option value="M1">M1 + M5 confirmation</option><option value="M5">M5 only</option></select></div><div class="field"><label for="c-profit-lock">Cost-aware profit lock</label><select id="c-profit-lock"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-lock-trigger">Profit-lock trigger</label><div class="input-unit"><input id="c-lock-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-lock-floor">Protected net floor</label><div class="input-unit"><input id="c-lock-floor" type="number" min="0" step="0.01" required><span>USD</span></div></div><div class="field"><label for="c-giveback">Peak giveback guard</label><select id="c-giveback"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-giveback-trigger">Giveback trigger</label><div class="input-unit"><input id="c-giveback-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-giveback-fraction">Maximum peak giveback</label><div class="input-unit"><input id="c-giveback-fraction" type="number" min="0.05" max="0.95" step="0.05" required><span>fraction</span></div></div><div class="field"><label for="c-breakeven-r">Secondary break-even</label><div class="input-unit"><input id="c-breakeven-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-r">Trailing-stop trigger</label><div class="input-unit"><input id="c-trailing-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-distance">Trailing distance</label><div class="input-unit"><input id="c-trailing-distance" type="number" min="0.05" max="10" step="0.05" required><span>R</span></div></div></div></section>
+        <section class="settings-section"><h3>Weekend crypto</h3><div class="form-grid two"><div class="field"><label for="c-weekend">Weekend trading</label><select id="c-weekend"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-weekend-symbols">Weekend symbols</label><input id="c-weekend-symbols" autocomplete="off"></div></div></section>
+        <div class="settings-notice"><strong>Restart required</strong><span>Saved settings apply after restart. Session arming is cleared; explicitly enabled account-bound autonomy may restore only after health checks pass.</span></div>
+      </div>
+      <footer class="modal-footer"><button class="button secondary" type="button" data-close-dialog="settings-dialog">Cancel</button><button id="save-settings-btn" class="button primary" type="submit">Save settings</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="modal confirmation-modal" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+    <form id="confirm-form">
+      <header class="modal-header"><div><p class="eyebrow">Action authorization</p><h2 id="confirm-title">Confirm action</h2></div></header>
+      <div class="modal-body"><p id="confirm-message"></p><div class="confirmation-phrase"><span>Type exactly</span><code id="confirm-phrase"></code></div><div class="field"><label for="confirm-input">Confirmation phrase</label><input id="confirm-input" autocomplete="off" spellcheck="false" required></div></div>
+      <footer class="modal-footer"><button id="confirm-cancel" class="button secondary" type="button">Cancel</button><button id="confirm-submit" class="button danger" type="submit" disabled>Confirm</button></footer>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <noscript><div class="noscript">JavaScript is required to monitor and control this local terminal.</div></noscript>
+</body>
+</html>
