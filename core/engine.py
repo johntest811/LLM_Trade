@@ -135,6 +135,7 @@ class TradingEngine:
         self._trough_persisted_usd: Dict[int, float] = {}
         self._early_profit_lock_tickets: set[int] = set()
         self._profit_lock_tickets: set[int] = set()
+        self._breakeven_tickets: set[int] = set()
         self._protection_failures: Dict[Tuple[int, str], Tuple[str, float]] = {}
         self._initial_risk_pips: Dict[int, float] = {}
         self._adverse_momentum_streaks: Dict[int, int] = {}
@@ -1257,6 +1258,7 @@ class TradingEngine:
             "_peak_state_loaded",
             "_early_profit_lock_tickets",
             "_profit_lock_tickets",
+            "_breakeven_tickets",
             "_baseline_error_tickets",
         ):
             getattr(self, name, set()).discard(ticket)
@@ -2991,6 +2993,7 @@ class TradingEngine:
                     self._trough_persisted_usd.clear()
                     self._early_profit_lock_tickets.clear()
                     self._profit_lock_tickets.clear()
+                    self._breakeven_tickets.clear()
                     self._protection_failures.clear()
                     self._initial_risk_pips.clear()
                     self._baseline_error_tickets.clear()
@@ -5724,9 +5727,33 @@ class TradingEngine:
                 and (r_profit_lock_ready or usd_profit_lock_ready)
                 and ticket not in self._profit_lock_tickets
             ):
+                # The R-based lock scales with the trade's actual favorable
+                # excursion.  A fixed $0.03 floor was too loose for positions
+                # that made meaningful progress without reaching the later
+                # break-even/trailing thresholds.  Retain the same fraction
+                # of the cost-adjusted peak that the giveback guard preserves,
+                # while keeping the configured dollar floor as a minimum.
+                # The executor converts this account-currency floor into the
+                # correct broker price and will only improve an existing SL.
+                lock_floor_usd = settings.profit_lock_floor_usd
+                if r_profit_lock_ready:
+                    estimated_cost_usd = max(
+                        0.0, profit_usd - estimated_net_profit_usd
+                    )
+                    peak_net_profit_usd = max(
+                        0.0, peak_profit_usd - estimated_cost_usd
+                    )
+                    retained_peak_fraction = (
+                        1.0 - settings.profit_giveback_fraction
+                    )
+                    lock_floor_usd = max(
+                        lock_floor_usd,
+                        peak_net_profit_usd * retained_peak_fraction,
+                    )
+                    lock_floor_usd = round(lock_floor_usd + 1e-12, 2)
                 result = await self.executor.lock_minimum_net_profit(
                     ticket,
-                    floor_usd=settings.profit_lock_floor_usd,
+                    floor_usd=lock_floor_usd,
                     expected_account=self._active_account_identity,
                 )
                 if result.success or "worsen" in str(result.error or "").lower():
@@ -5735,7 +5762,8 @@ class TradingEngine:
                         self.log(
                             f"Profit floor armed for ticket {ticket} ({symbol}) "
                             f"after persisted peak +{peak_r:.2f} R / "
-                            f"${peak_profit_usd:.2f}."
+                            f"${peak_profit_usd:.2f}; protected net floor "
+                            f"${lock_floor_usd:.2f}."
                         )
                 else:
                     self._log_protection_failure(
@@ -5743,12 +5771,30 @@ class TradingEngine:
                     )
 
             # ── 4. Break-even at a configured R multiple ──────────────
-            if risk_pips > 0 and profit_pips >= risk_pips * settings.breakeven_trigger_r:
-                await self.executor.move_to_breakeven(
+            if not hasattr(self, "_breakeven_tickets"):
+                self._breakeven_tickets = set()
+            if (
+                risk_pips > 0
+                and profit_pips >= risk_pips * settings.breakeven_trigger_r
+                and ticket not in self._breakeven_tickets
+            ):
+                breakeven_result = await self.executor.move_to_breakeven(
                     ticket,
                     buffer_pips=settings.breakeven_buffer_pips,
                     expected_account=self._active_account_identity,
                 )
+                breakeven_error = str(breakeven_result.error or "").lower()
+                if breakeven_result.success or "worsen" in breakeven_error:
+                    # A stronger profit/trailing stop already satisfies the
+                    # break-even objective. Do not query and warn every 0.5s.
+                    self._breakeven_tickets.add(ticket)
+                else:
+                    self._log_protection_failure(
+                        ticket,
+                        symbol,
+                        "Break-even",
+                        breakeven_result.error,
+                    )
             
             # ── 5. Volatility-normalized trailing stop ────────────────
             if risk_pips > 0 and profit_pips >= risk_pips * settings.trailing_trigger_r:

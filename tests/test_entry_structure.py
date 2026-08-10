@@ -433,6 +433,88 @@ class EntryStructureGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Overextension", reason)
 
+    def test_exhausted_bos_breakout_without_macro_event_waits_for_retest(self):
+        m5 = _analysis(
+            "M5",
+            adx=40.8,
+            breakout="BULLISH BREAKOUT",
+            stoch=97.3,
+            rsi=67.6,
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-10 09:10:00",
+            }],
+        )
+        m15 = _analysis("M15", adx=30.0)
+        h1 = _analysis("H1", adx=25.0)
+        h4 = _analysis("H4", adx=25.0)
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", m5, m15, h1, h4,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("BOS Breakout Exhaustion", reason)
+
+    def test_exhausted_bos_breakout_with_h4_choch_remains_allowed(self):
+        m5 = _analysis(
+            "M5",
+            adx=39.3,
+            breakout="BULLISH BREAKOUT",
+            stoch=100.0,
+            rsi=71.7,
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-10 09:35:00",
+            }],
+        )
+        m15 = _analysis("M15", adx=30.0)
+        h1 = _analysis("H1", adx=25.0)
+        h4 = _analysis(
+            "H4",
+            adx=25.0,
+            events=[{
+                "type": "CHOCH",
+                "direction": "BULLISH",
+                "time": "2026-08-10 05:00:00",
+            }],
+        )
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", m5, m15, h1, h4,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertTrue(ok, reason)
+
+    def test_exhausted_bos_breakout_with_directional_pattern_remains_allowed(self):
+        m5 = _analysis(
+            "M5",
+            adx=32.4,
+            breakout="BULLISH BREAKOUT",
+            stoch=99.1,
+            rsi=67.0,
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-10 05:40:00",
+            }],
+        )
+        m5["market_structure"]["candlestick_patterns"] = [
+            "Bullish Engulfing (Bullish Reversal)"
+        ]
+        confirmations = [_analysis(tf, adx=25.0) for tf in ("M15", "H1", "H4")]
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", m5, *confirmations,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertTrue(ok, reason)
+
     def test_recent_eurusd_breakout_loss_is_rejected_before_entry(self):
         """Regression for ticket 312865538's completed-candle snapshot."""
         m5 = _analysis(

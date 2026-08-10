@@ -1528,7 +1528,7 @@ function fillSettings(config) {
   $("c-lock-trigger").value = config.profit_lock_trigger_r ?? .75;
   $("c-lock-floor").value = config.profit_lock_floor_usd ?? .03;
   $("c-giveback").value = String(config.profit_giveback_enabled ?? true);
-  $("c-giveback-trigger").value = config.profit_giveback_trigger_r ?? 1;
+  $("c-giveback-trigger").value = config.profit_giveback_trigger_r ?? .5;
   $("c-giveback-fraction").value = config.profit_giveback_fraction ?? .5;
   $("c-breakeven-r").value = config.breakeven_trigger_r ?? .75;
   $("c-trailing-r").value = config.trailing_trigger_r ?? 1;

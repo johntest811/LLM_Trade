@@ -768,10 +768,8 @@ class RiskManager:
             for pattern in m5_structure.get("candlestick_patterns", []) or []
         ]
         has_directional_pattern = any(expected in pattern for pattern in patterns)
-        breakout_exhausted = (
-            breakout_only
-            and not has_directional_pattern
-            and math.isfinite(stoch_k)
+        exhausted_momentum = (
+            math.isfinite(stoch_k)
             and math.isfinite(rsi)
             and (
                 (
@@ -785,6 +783,50 @@ class RiskManager:
                     and rsi <= settings.overextension_rsi_low
                 )
             )
+        )
+
+        # A same-candle M5 BOS plus breakout can still be the final push of an
+        # exhausted move. Trend labels alone did not protect the historical
+        # GBPUSD/NZDUSD/USDJPY examples from immediate failure. Preserve timely
+        # winners when a directional candle pattern, verified retest, or an
+        # actual H1/H4 structure event confirms the continuation; otherwise
+        # wait for the retest instead of treating the BOS label as sufficient.
+        def _macro_structure_confirms(analysis: Optional[Dict[str, Any]]) -> bool:
+            macro = structure(analysis)
+            macro_events = macro.get("structure_events", []) or []
+            event_confirms = any(
+                isinstance(event, dict)
+                and str(event.get("direction", "")).upper() == expected
+                and str(event.get("type", "")).upper() in {"BOS", "CHOCH"}
+                for event in macro_events
+            )
+            macro_breakout = str(macro.get("breakout_status", "")).upper()
+            return event_confirms or (
+                expected in macro_breakout and "BREAKOUT" in macro_breakout
+            )
+
+        exhausted_bos_breakout = (
+            has_bos
+            and has_breakout
+            and not has_retest
+            and not has_directional_pattern
+            and not _macro_structure_confirms(h1_analysis)
+            and not _macro_structure_confirms(h4_analysis)
+            and exhausted_momentum
+        )
+        if exhausted_bos_breakout:
+            return (
+                False,
+                f"REJECTED [Overextension - BOS Breakout Exhaustion]: "
+                f"{action} BOS/breakout is unretested while stochastic "
+                f"{stoch_k:.1f} and RSI {rsi:.1f} are both extended, with no "
+                "directional candle pattern or H1/H4 structure event. Wait "
+                "for a verified retest or fresh macro confirmation.",
+            )
+        breakout_exhausted = (
+            breakout_only
+            and not has_directional_pattern
+            and exhausted_momentum
         )
         if breakout_exhausted:
             return (

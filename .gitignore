@@ -3,5 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.db
+*.db-shm
+*.db-wal
 *.log
 scratch/*.csv

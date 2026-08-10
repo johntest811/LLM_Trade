@@ -241,6 +241,116 @@ class EngineResilienceTests(unittest.TestCase):
             88, expected_account=engine._active_account_identity
         )
 
+    def test_mid_r_profit_lock_scales_floor_from_cost_adjusted_peak(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.executor = SimpleNamespace(
+            close_position=AsyncMock(),
+            lock_minimum_net_profit=AsyncMock(
+                return_value=ExecutionResult(True, 188, 0.70715, 0.02, None)
+            ),
+            move_to_breakeven=AsyncMock(),
+            apply_trailing_stop=AsyncMock(),
+        )
+        engine._active_account_identity = {"login": 1001}
+        engine._peak_profits = {188: 7.3}
+        engine._peak_profit_usd = {188: 0.88}
+        engine._profit_lock_tickets = set()
+        engine.replay_logger = SimpleNamespace(
+            update_replay_outcome=MagicMock()
+        )
+        engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))
+        engine.log = MagicMock()
+        position = {
+            "ticket": 188,
+            "symbol": "AUDUSD",
+            "profit": 0.84,
+            "estimated_net_profit_usd": 0.80,
+            "profit_pips": 7.0,
+            "peak_profit_usd": 0.88,
+            "initial_risk_pips": 10.0,
+            "volume": 0.02,
+            "price_current": 0.70764,
+            "sl": 0.70634,
+            "tp": 0.70807,
+        }
+        protection_settings = replace(
+            settings,
+            micro_profit_protection_enabled=False,
+            early_profit_lock_enabled=False,
+            profit_lock_enabled=True,
+            profit_lock_trigger_r=0.50,
+            profit_lock_min_live_fraction=0.75,
+            profit_lock_floor_usd=0.03,
+            profit_giveback_enabled=True,
+            profit_giveback_trigger_r=0.50,
+            profit_giveback_fraction=0.50,
+            breakeven_trigger_r=10.0,
+            trailing_trigger_r=10.0,
+        )
+
+        with patch("core.engine.settings", protection_settings):
+            asyncio.run(engine._apply_protections([position]))
+
+        engine.executor.close_position.assert_not_awaited()
+        engine.executor.lock_minimum_net_profit.assert_awaited_once_with(
+            188,
+            floor_usd=0.42,
+            expected_account=engine._active_account_identity,
+        )
+
+    def test_mid_r_giveback_closes_after_half_of_peak_is_lost(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.executor = SimpleNamespace(
+            close_position=AsyncMock(
+                return_value=ExecutionResult(True, 189, 0.70729, 0.02, None)
+            ),
+            lock_minimum_net_profit=AsyncMock(),
+            move_to_breakeven=AsyncMock(),
+            apply_trailing_stop=AsyncMock(),
+        )
+        engine._active_account_identity = {"login": 1001}
+        engine._peak_profits = {189: 7.3}
+        engine._peak_profit_usd = {189: 0.88}
+        engine._profit_lock_tickets = {189}
+        engine.replay_logger = SimpleNamespace(
+            update_replay_outcome=MagicMock()
+        )
+        engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))
+        engine.log = MagicMock()
+        position = {
+            "ticket": 189,
+            "symbol": "AUDUSD",
+            "profit": 0.42,
+            "estimated_net_profit_usd": 0.38,
+            "profit_pips": 3.5,
+            "peak_profit_usd": 0.88,
+            "initial_risk_pips": 10.0,
+            "volume": 0.02,
+            "price_current": 0.70729,
+            "sl": 0.70634,
+            "tp": 0.70807,
+        }
+        protection_settings = replace(
+            settings,
+            micro_profit_protection_enabled=False,
+            early_profit_lock_enabled=False,
+            profit_lock_enabled=True,
+            profit_lock_trigger_r=0.50,
+            profit_giveback_enabled=True,
+            profit_giveback_trigger_r=0.50,
+            profit_giveback_fraction=0.50,
+            breakeven_trigger_r=10.0,
+            trailing_trigger_r=10.0,
+        )
+
+        with patch("core.engine.settings", protection_settings):
+            asyncio.run(engine._apply_protections([position]))
+
+        engine.executor.close_position.assert_awaited_once_with(
+            189, expected_account=engine._active_account_identity
+        )
+        engine.executor.lock_minimum_net_profit.assert_not_awaited()
+
     def test_fixed_dollar_giveback_works_without_risk_baseline(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
@@ -796,6 +906,68 @@ class EngineResilienceTests(unittest.TestCase):
             asyncio.run(engine._apply_protections([position]))
 
         engine.executor.lock_minimum_net_profit.assert_not_awaited()
+
+    def test_stronger_stop_satisfies_break_even_without_repeated_requests(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.executor = SimpleNamespace(
+            close_position=AsyncMock(),
+            lock_minimum_net_profit=AsyncMock(),
+            move_to_breakeven=AsyncMock(
+                return_value=ExecutionResult(
+                    False,
+                    197,
+                    None,
+                    None,
+                    "Break-even would worsen the current stop",
+                )
+            ),
+            apply_trailing_stop=AsyncMock(),
+        )
+        engine._active_account_identity = {"login": 1001}
+        engine._peak_profits = {197: 8.0}
+        engine._peak_profit_usd = {197: 0.80}
+        engine._early_profit_lock_tickets = set()
+        engine._profit_lock_tickets = {197}
+        engine._breakeven_tickets = set()
+        engine.replay_logger = SimpleNamespace(update_replay_outcome=MagicMock())
+        engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))
+        engine.log = MagicMock()
+        position = {
+            "ticket": 197,
+            "symbol": "USDJPY",
+            "profit": 0.80,
+            "estimated_net_profit_usd": 0.80,
+            "profit_pips": 8.0,
+            "peak_profit_usd": 0.80,
+            "initial_risk_pips": 10.0,
+            "duration_min": 10.0,
+            "volume": 0.02,
+            "price_current": 158.80,
+            "sl": 158.79,
+            "tp": 158.95,
+        }
+        protection_settings = replace(
+            settings,
+            micro_profit_protection_enabled=False,
+            auto_close_profit_enabled=False,
+            auto_close_loss_enabled=False,
+            profit_giveback_enabled=False,
+            profit_lock_enabled=False,
+            position_stagnation_exit_enabled=False,
+            breakeven_trigger_r=0.75,
+            trailing_trigger_r=10.0,
+        )
+
+        with patch("core.engine.settings", protection_settings):
+            asyncio.run(engine._apply_protections([position]))
+            asyncio.run(engine._apply_protections([position]))
+
+        engine.executor.move_to_breakeven.assert_awaited_once_with(
+            197,
+            buffer_pips=protection_settings.breakeven_buffer_pips,
+            expected_account=engine._active_account_identity,
+        )
+        self.assertIn(197, engine._breakeven_tickets)
 
     def test_stagnation_exit_closes_only_after_bars_without_progress(self):
         engine = TradingEngine.__new__(TradingEngine)

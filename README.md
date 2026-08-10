@@ -235,6 +235,16 @@ outage.
 - Profit peaks are account-and-ticket scoped and persisted. A restart therefore
   cannot erase the fact that a still-open trade previously crossed the
   configured profit-protection trigger.
+- Once a position reaches the configured mid-profit threshold (0.5R by
+  default), its broker-side profit floor retains the configured share of the
+  cost-adjusted peak. The giveback guard uses the same threshold as a fallback
+  without shortening the original stop before that progress exists.
+- An exhausted same-candle M5 BOS/breakout must also have a verified retest, a
+  directional candle pattern, or an actual H1/H4 structure event. Higher-
+  timeframe direction labels alone cannot authorize that chased setup.
+- Break-even protection is account-and-ticket scoped and becomes satisfied
+  when the existing broker stop is already stronger, avoiding repeated MT5
+  modification requests during the 0.5-second protection loop.
 - The adaptive universe is refreshed every 60 seconds by default, outside the
   fresh-candle entry path. Unaffordable symbols can remain visible for discovery
   but are excluded before model inference, and a signal is discarded if its

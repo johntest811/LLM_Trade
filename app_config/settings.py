@@ -459,7 +459,7 @@ class AppConfig:
     )
     profit_giveback_enabled: bool = _bool("PROFIT_GIVEBACK_ENABLED", True)
     profit_giveback_trigger_r: float = max(
-        0.1, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_R", "1.0"))
+        0.1, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_R", "0.50"))
     )
     profit_giveback_trigger_usd: float = max(
         0.0, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_USD", "0.20"))
