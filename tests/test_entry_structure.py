@@ -80,6 +80,168 @@ class EntryStructureGateTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
+    def test_fresh_aligned_bos_is_directionally_symmetric(self):
+        for action, direction, rsi, stoch in (
+            ("BUY", "BULLISH", 55.0, 60.0),
+            ("SELL", "BEARISH", 45.0, 40.0),
+        ):
+            with self.subTest(action=action):
+                analyses = [
+                    _analysis(
+                        timeframe,
+                        trend=direction,
+                        direction=direction,
+                        rsi=rsi,
+                        stoch=stoch,
+                    )
+                    for timeframe in ("M5", "M15", "H1", "H4")
+                ]
+                analyses[0]["market_structure"]["structure_events"] = [{
+                    "type": "BOS",
+                    "direction": direction,
+                    "time": "2026-07-23 07:20:00",
+                }]
+
+                ok, reason = RiskManager._check_entry_structure(
+                    action,
+                    *analyses,
+                    {"trend_align": True, "tf_agreement": True},
+                )
+
+                self.assertTrue(ok, reason)
+
+    def test_bounded_aligned_adx_decline_is_directionally_symmetric(self):
+        configured = replace(
+            settings,
+            entry_min_adx=15.0,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=20.0,
+            entry_adx_decline_tolerance=0.5,
+            entry_aligned_adx_decline_tolerance=1.5,
+        )
+        for action, direction, rsi, stoch in (
+            ("BUY", "BULLISH", 55.0, 60.0),
+            ("SELL", "BEARISH", 45.0, 40.0),
+        ):
+            with self.subTest(action=action):
+                analyses = [
+                    _analysis(
+                        timeframe,
+                        trend=direction,
+                        direction=direction,
+                        adx=30.0,
+                        adx_delta=-1.0 if timeframe == "M5" else 0.5,
+                        rsi=rsi,
+                        stoch=stoch,
+                    )
+                    for timeframe in ("M5", "M15", "H1", "H4")
+                ]
+                analyses[0]["market_structure"]["structure_events"] = [{
+                    "type": "BOS",
+                    "direction": direction,
+                    "time": "2026-07-23 07:20:00",
+                }]
+
+                with patch("risk.manager.settings", configured):
+                    ok, reason = RiskManager._check_entry_structure(
+                        action,
+                        *analyses,
+                        {"trend_align": True, "tf_agreement": True},
+                    )
+
+                self.assertTrue(ok, reason)
+
+    def test_aligned_adx_exception_remains_bounded(self):
+        analyses = [
+            _analysis(
+                timeframe,
+                adx=30.0,
+                adx_delta=-1.6 if timeframe == "M5" else 0.5,
+            )
+            for timeframe in ("M5", "M15", "H1", "H4")
+        ]
+        analyses[0]["market_structure"]["structure_events"] = [{
+            "type": "BOS",
+            "direction": "BULLISH",
+            "time": "2026-07-23 07:20:00",
+        }]
+        configured = replace(
+            settings,
+            entry_adx_decline_tolerance=0.5,
+            entry_aligned_adx_decline_tolerance=1.5,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=20.0,
+        )
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                {"trend_align": True, "tf_agreement": True},
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("ADX Direction", reason)
+
+    def test_unconfirmed_bos_near_resistance_requires_more_room(self):
+        analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
+        analyses[0]["market_structure"].update(
+            resistance=101.60,
+            structure_events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-07-23 07:20:00",
+            }],
+        )
+        configured = replace(
+            settings,
+            entry_min_opposing_distance_atr=1.25,
+            entry_unconfirmed_bos_min_opposing_distance_atr=1.75,
+        )
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                {
+                    "pattern_confluence": False,
+                    "fvg_alignment": False,
+                    "sup_res_proximity": False,
+                },
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Opposing Zone - Unconfirmed BOS", reason)
+
+    def test_directional_pattern_keeps_normal_bos_zone_threshold(self):
+        analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
+        analyses[0]["market_structure"].update(
+            resistance=101.60,
+            structure_events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-07-23 07:20:00",
+            }],
+        )
+        configured = replace(
+            settings,
+            entry_min_opposing_distance_atr=1.25,
+            entry_unconfirmed_bos_min_opposing_distance_atr=1.75,
+        )
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                {
+                    "pattern_confluence": True,
+                    "fvg_alignment": False,
+                    "sup_res_proximity": False,
+                },
+            )
+
+        self.assertTrue(ok, reason)
+
     def test_verified_pullback_retest_is_a_fresh_structure_trigger(self):
         analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
         analyses[0]["market_structure"]["retest_continuation"] = {
@@ -95,8 +257,9 @@ class EntryStructureGateTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
 
-    def test_falling_adx_rejects_fresh_trigger(self):
+    def test_falling_adx_without_strong_momentum_rejects_fresh_trigger(self):
         analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
+        analyses[0]["indicators"]["adx_14"] = 24.0
         analyses[0]["indicators"]["adx_delta"] = -0.75
         analyses[0]["market_structure"]["structure_events"] = [{
             "type": "BOS",
@@ -433,6 +596,100 @@ class EntryStructureGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Overextension", reason)
 
+    def test_compact_strong_exhausted_breakout_is_directionally_symmetric(self):
+        for action, direction, breakout, stoch, rsi, signed_move in (
+            ("BUY", "BULLISH", "BULLISH BREAKOUT", 95.0, 70.0, 0.40),
+            ("SELL", "BEARISH", "BEARISH BREAKOUT", 5.0, 30.0, -0.40),
+        ):
+            with self.subTest(action=action):
+                m5 = _analysis(
+                    "M5",
+                    trend=direction,
+                    direction=direction,
+                    adx=32.0,
+                    breakout=breakout,
+                    stoch=stoch,
+                    rsi=rsi,
+                    candle_range_atr=0.65,
+                    candle_return_atr=signed_move,
+                    candle_body_atr_signed=signed_move,
+                )
+                m15 = _analysis(
+                    "M15", trend=direction, direction=direction, adx=27.0
+                )
+                h1 = _analysis(
+                    "H1", trend=direction, direction=direction, adx=20.0
+                )
+                h4 = _analysis(
+                    "H4", trend=direction, direction=direction, adx=20.0
+                )
+
+                ok, reason = RiskManager._check_entry_structure(
+                    action,
+                    m5,
+                    m15,
+                    h1,
+                    h4,
+                    strategy_mode="TREND_CONTINUATION",
+                )
+
+                self.assertTrue(ok, reason)
+
+    def test_exhausted_breakout_exception_rejects_late_extension(self):
+        analyses = [
+            _analysis(
+                timeframe,
+                adx=32.0 if timeframe == "M5" else 27.0,
+            )
+            for timeframe in ("M5", "M15", "H1", "H4")
+        ]
+        analyses[0] = _analysis(
+            "M5",
+            adx=32.0,
+            breakout="BULLISH BREAKOUT",
+            stoch=95.0,
+            rsi=70.0,
+            candle_range_atr=1.10,
+            candle_return_atr=0.90,
+            candle_body_atr_signed=0.90,
+        )
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", *analyses, strategy_mode="TREND_CONTINUATION"
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Breakout Exhaustion", reason)
+
+    def test_exhausted_breakout_exception_requires_h4_alignment(self):
+        m5 = _analysis(
+            "M5",
+            adx=32.0,
+            breakout="BEARISH BREAKOUT",
+            trend="BEARISH",
+            direction="BEARISH",
+            stoch=5.0,
+            rsi=30.0,
+            candle_range_atr=0.65,
+            candle_return_atr=-0.40,
+            candle_body_atr_signed=-0.40,
+        )
+        m15 = _analysis(
+            "M15", trend="BEARISH", direction="BEARISH", adx=27.0
+        )
+        h1 = _analysis(
+            "H1", trend="BEARISH", direction="BEARISH", adx=20.0
+        )
+        h4 = _analysis("H4", trend="BULLISH", direction="BULLISH", adx=20.0)
+
+        ok, reason = RiskManager._check_entry_structure(
+            "SELL", m5, m15, h1, h4,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Breakout Exhaustion", reason)
+
     def test_exhausted_bos_breakout_without_macro_event_waits_for_retest(self):
         m5 = _analysis(
             "M5",
@@ -461,6 +718,7 @@ class EntryStructureGateTests(unittest.TestCase):
     def test_exhausted_bos_breakout_with_h4_choch_remains_allowed(self):
         m5 = _analysis(
             "M5",
+            timestamp="2026-08-10 09:35:00",
             adx=39.3,
             breakout="BULLISH BREAKOUT",
             stoch=100.0,
@@ -510,6 +768,96 @@ class EntryStructureGateTests(unittest.TestCase):
 
         ok, reason = RiskManager._check_entry_structure(
             "BUY", m5, *confirmations,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertTrue(ok, reason)
+
+    def test_late_buy_ask_is_rejected_even_when_bid_drift_is_bounded(self):
+        analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
+        analyses[0]["market_structure"]["structure_events"] = [{
+            "type": "BOS",
+            "direction": "BULLISH",
+            "time": "2026-08-11 13:40:00",
+        }]
+        snapshot = SimpleNamespace(
+            metrics=SimpleNamespace(bid=100.20, ask=100.65)
+        )
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", *analyses, market_snapshot=snapshot
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Executable Price", reason)
+        self.assertIn("0.65 ATR", reason)
+
+    def test_old_h1_event_does_not_excuse_exhausted_bos_breakout(self):
+        m5 = _analysis(
+            "M5",
+            timestamp="2026-08-11 13:40:00",
+            breakout="BULLISH BREAKOUT",
+            stoch=94.9,
+            rsi=61.9,
+            candle_range_atr=0.85,
+            candle_return_atr=0.65,
+            candle_body_atr_signed=0.65,
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-11 13:40:00",
+            }],
+        )
+        m15 = _analysis("M15", timestamp="2026-08-11 13:30:00")
+        h1 = _analysis(
+            "H1",
+            timestamp="2026-08-11 13:00:00",
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-11 12:00:00",
+            }],
+        )
+        h4 = _analysis("H4", timestamp="2026-08-11 12:00:00")
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", m5, m15, h1, h4,
+            strategy_mode="TREND_CONTINUATION",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("BOS Breakout Exhaustion", reason)
+
+    def test_fresh_h1_event_can_confirm_same_exhausted_bos_breakout(self):
+        m5 = _analysis(
+            "M5",
+            timestamp="2026-08-11 13:40:00",
+            breakout="BULLISH BREAKOUT",
+            stoch=94.9,
+            rsi=61.9,
+            candle_range_atr=0.85,
+            candle_return_atr=0.65,
+            candle_body_atr_signed=0.65,
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-11 13:40:00",
+            }],
+        )
+        m15 = _analysis("M15", timestamp="2026-08-11 13:30:00")
+        h1 = _analysis(
+            "H1",
+            timestamp="2026-08-11 13:00:00",
+            events=[{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-08-11 12:30:00",
+            }],
+        )
+        h4 = _analysis("H4", timestamp="2026-08-11 12:00:00")
+
+        ok, reason = RiskManager._check_entry_structure(
+            "BUY", m5, m15, h1, h4,
             strategy_mode="TREND_CONTINUATION",
         )
 
@@ -702,6 +1050,114 @@ class EntryStructureGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Entry Chase", reason)
 
+    def test_bounded_aligned_chase_allows_high_confidence_structural_impulse(self):
+        configured = replace(
+            settings,
+            entry_max_candle_range_atr=1.50,
+            entry_strong_alignment_chase_min_confidence=0.85,
+            entry_strong_alignment_chase_max_extension_atr=2.00,
+        )
+        analyses = [
+            _analysis(
+                tf,
+                adx=32.0 if tf in {"M5", "M15"} else 25.0,
+                candle_range_atr=1.86 if tf == "M5" else 1.0,
+                candle_return_atr=1.78 if tf == "M5" else 0.0,
+                candle_body_atr_signed=1.72 if tf == "M5" else 0.0,
+            )
+            for tf in ("M5", "M15", "H1", "H4")
+        ]
+        analyses[0]["market_structure"]["structure_events"] = [{
+            "type": "BOS",
+            "direction": "BULLISH",
+            "time": "2026-07-27 13:55:00",
+        }]
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                strategy_mode="TREND_CONTINUATION",
+                decision_confidence=0.90,
+            )
+
+        self.assertTrue(ok, reason)
+
+    def test_bounded_aligned_chase_keeps_confidence_and_extension_caps(self):
+        configured = replace(
+            settings,
+            entry_max_candle_range_atr=1.50,
+            entry_strong_alignment_chase_min_confidence=0.85,
+            entry_strong_alignment_chase_max_extension_atr=2.00,
+        )
+
+        def extended_analyses(extension):
+            values = [
+                _analysis(
+                    tf,
+                    adx=32.0 if tf in {"M5", "M15"} else 25.0,
+                    candle_range_atr=extension if tf == "M5" else 1.0,
+                    candle_return_atr=extension if tf == "M5" else 0.0,
+                    candle_body_atr_signed=extension if tf == "M5" else 0.0,
+                )
+                for tf in ("M5", "M15", "H1", "H4")
+            ]
+            values[0]["market_structure"]["structure_events"] = [{
+                "type": "BOS",
+                "direction": "BULLISH",
+                "time": "2026-07-27 13:55:00",
+            }]
+            return values
+
+        with patch("risk.manager.settings", configured):
+            low_confidence = RiskManager._check_entry_structure(
+                "BUY",
+                *extended_analyses(1.80),
+                strategy_mode="TREND_CONTINUATION",
+                decision_confidence=0.84,
+            )
+            too_extended = RiskManager._check_entry_structure(
+                "BUY",
+                *extended_analyses(2.01),
+                strategy_mode="TREND_CONTINUATION",
+                decision_confidence=0.90,
+            )
+
+        self.assertFalse(low_confidence[0])
+        self.assertIn("Entry Chase", low_confidence[1])
+        self.assertFalse(too_extended[0])
+        self.assertIn("Entry Chase", too_extended[1])
+
+    def test_bounded_aligned_chase_does_not_excuse_breakout_only_entry(self):
+        configured = replace(
+            settings,
+            entry_max_candle_range_atr=1.50,
+            entry_strong_alignment_chase_min_confidence=0.85,
+            entry_strong_alignment_chase_max_extension_atr=2.00,
+        )
+        analyses = [
+            _analysis(
+                tf,
+                adx=32.0 if tf in {"M5", "M15"} else 25.0,
+                breakout="BULLISH BREAKOUT" if tf == "M5" else "None",
+                candle_range_atr=1.80 if tf == "M5" else 1.0,
+                candle_return_atr=1.75 if tf == "M5" else 0.0,
+                candle_body_atr_signed=1.70 if tf == "M5" else 0.0,
+            )
+            for tf in ("M5", "M15", "H1", "H4")
+        ]
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                strategy_mode="TREND_CONTINUATION",
+                decision_confidence=0.90,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Entry Chase", reason)
+
     def test_long_wick_is_not_misclassified_as_entry_chase(self):
         analyses = [
             _analysis(
@@ -861,6 +1317,133 @@ class EntryStructureGateTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("Execution Drift", reason)
+
+    def test_strong_alignment_drift_exception_is_directionally_symmetric(self):
+        configured = replace(
+            settings,
+            entry_max_execution_drift_atr=0.25,
+            entry_strong_alignment_max_execution_drift_atr=0.40,
+            entry_strong_alignment_min_confidence=0.80,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=19.1,
+            breakout_macro_min_adx=15.0,
+            entry_min_h4_adx=14.5,
+        )
+        for action, direction, bid, ask, rsi, stoch in (
+            ("BUY", "BULLISH", 100.35, 100.36, 55.0, 60.0),
+            ("SELL", "BEARISH", 99.65, 99.66, 45.0, 40.0),
+        ):
+            with self.subTest(action=action):
+                analyses = [
+                    _analysis(
+                        timeframe,
+                        trend=direction,
+                        direction=direction,
+                        adx=30.0,
+                        rsi=rsi,
+                        stoch=stoch,
+                    )
+                    for timeframe in ("M5", "M15", "H1", "H4")
+                ]
+                analyses[0]["market_structure"]["structure_events"] = [{
+                    "type": "BOS",
+                    "direction": direction,
+                    "time": "2026-07-27 13:55:00",
+                }]
+                snapshot = SimpleNamespace(
+                    metrics=SimpleNamespace(bid=bid, ask=ask)
+                )
+
+                with patch("risk.manager.settings", configured):
+                    ok, reason = RiskManager._check_entry_structure(
+                        action,
+                        *analyses,
+                        strategy_mode="TREND_CONTINUATION",
+                        market_snapshot=snapshot,
+                        decision_confidence=0.80,
+                    )
+
+                self.assertTrue(ok, reason)
+
+    def test_strong_alignment_drift_exception_keeps_hard_ceiling(self):
+        analyses = [
+            _analysis(timeframe, adx=30.0)
+            for timeframe in ("M5", "M15", "H1", "H4")
+        ]
+        analyses[0]["market_structure"]["structure_events"] = [{
+            "type": "BOS",
+            "direction": "BULLISH",
+            "time": "2026-07-27 13:55:00",
+        }]
+        configured = replace(
+            settings,
+            entry_max_execution_drift_atr=0.25,
+            entry_strong_alignment_max_execution_drift_atr=0.40,
+            entry_strong_alignment_min_confidence=0.80,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=19.1,
+            breakout_macro_min_adx=15.0,
+            entry_min_h4_adx=14.5,
+        )
+
+        with patch("risk.manager.settings", configured):
+            ok, reason = RiskManager._check_entry_structure(
+                "BUY",
+                *analyses,
+                strategy_mode="TREND_CONTINUATION",
+                market_snapshot=SimpleNamespace(
+                    metrics=SimpleNamespace(bid=100.41, ask=100.42)
+                ),
+                decision_confidence=0.90,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Execution Drift", reason)
+        self.assertIn("0.40 ATR", reason)
+
+    def test_strong_alignment_drift_exception_requires_confidence_and_macro(self):
+        configured = replace(
+            settings,
+            entry_max_execution_drift_atr=0.25,
+            entry_strong_alignment_max_execution_drift_atr=0.40,
+            entry_strong_alignment_min_confidence=0.80,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=19.1,
+            breakout_macro_min_adx=15.0,
+            entry_min_h4_adx=14.5,
+        )
+        for label, confidence, h4_direction in (
+            ("low-confidence", 0.79, "BULLISH"),
+            ("opposing-h4", 0.90, "BEARISH"),
+        ):
+            with self.subTest(case=label):
+                analyses = [
+                    _analysis(timeframe, adx=30.0)
+                    for timeframe in ("M5", "M15", "H1", "H4")
+                ]
+                analyses[3]["market_structure"]["trend"] = h4_direction
+                analyses[3]["market_structure"][
+                    "trend_state_direction"
+                ] = h4_direction
+                analyses[0]["market_structure"]["structure_events"] = [{
+                    "type": "BOS",
+                    "direction": "BULLISH",
+                    "time": "2026-07-27 13:55:00",
+                }]
+
+                with patch("risk.manager.settings", configured):
+                    ok, reason = RiskManager._check_entry_structure(
+                        "BUY",
+                        *analyses,
+                        strategy_mode="TREND_CONTINUATION",
+                        market_snapshot=SimpleNamespace(
+                            metrics=SimpleNamespace(bid=100.35, ask=100.36)
+                        ),
+                        decision_confidence=confidence,
+                    )
+
+                self.assertFalse(ok)
+                self.assertIn("Execution Drift", reason)
 
     def test_buy_spread_is_not_counted_as_execution_drift(self):
         analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]

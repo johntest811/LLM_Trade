@@ -27,7 +27,7 @@ logger = logging.getLogger("TradingSystem.Dashboard")
 
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
-LOCAL_LLM_QUANTIZATION_PROFILES = ("AUTO", "Q6_K", "Q8_0")
+LOCAL_LLM_QUANTIZATION_PROFILES = ("AUTO", "Q4_K_M", "Q6_K", "Q8_0")
 
 
 def _config_env_path() -> Path:
@@ -207,7 +207,10 @@ async def _broadcast_loop():
         # rendering cannot delay broker/position state writers.
         try:
             snapshot = (
-                dashboard_state.to_dict()
+                dashboard_state.to_dict(
+                    compact=True,
+                    include_tick_stream=False,
+                )
                 if counter % 3 == 0
                 else _live_payload()
             )
@@ -262,7 +265,14 @@ async def websocket_endpoint(websocket: WebSocket):
         # writes. The endpoint then only receives, avoiding concurrent writes
         # to one Starlette WebSocket.
         await asyncio.wait_for(
-            websocket.send_text(json.dumps(dashboard_state.to_dict())),
+            websocket.send_text(
+                json.dumps(
+                    dashboard_state.to_dict(
+                        compact=True,
+                        include_tick_stream=False,
+                    )
+                )
+            ),
             timeout=2.0,
         )
         _ws_clients.add(websocket)
@@ -280,7 +290,9 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/state")
 async def get_state():
-    return JSONResponse(dashboard_state.to_dict())
+    return JSONResponse(
+        dashboard_state.to_dict(compact=True, include_tick_stream=False)
+    )
 
 
 @app.get("/api/live")
@@ -324,6 +336,9 @@ async def get_config():
         "entry_min_adx": settings.entry_min_adx,
         "entry_require_adx_rising": settings.entry_require_adx_rising,
         "entry_min_opposing_distance_atr": settings.entry_min_opposing_distance_atr,
+        "entry_unconfirmed_bos_min_opposing_distance_atr": (
+            settings.entry_unconfirmed_bos_min_opposing_distance_atr
+        ),
         "same_thesis_reentry_min_bars": settings.same_thesis_reentry_min_bars,
         "retest_continuation_enabled": settings.retest_continuation_enabled,
         "retest_min_resumption_atr": settings.retest_min_resumption_atr,
@@ -342,9 +357,30 @@ async def get_config():
         "entry_max_execution_drift_atr": (
             settings.entry_max_execution_drift_atr
         ),
+        "entry_strong_alignment_max_execution_drift_atr": (
+            settings.entry_strong_alignment_max_execution_drift_atr
+        ),
+        "entry_strong_alignment_min_confidence": (
+            settings.entry_strong_alignment_min_confidence
+        ),
+        "entry_strong_alignment_chase_min_confidence": (
+            settings.entry_strong_alignment_chase_min_confidence
+        ),
+        "entry_strong_alignment_chase_max_extension_atr": (
+            settings.entry_strong_alignment_chase_max_extension_atr
+        ),
+        "entry_max_executable_premium_atr": (
+            settings.entry_max_executable_premium_atr
+        ),
         "breakout_min_quality_score": settings.breakout_min_quality_score,
         "breakout_macro_min_adx": settings.breakout_macro_min_adx,
         "breakout_strong_lower_adx": settings.breakout_strong_lower_adx,
+        "breakout_exhaustion_continuation_enabled": (
+            settings.breakout_exhaustion_continuation_enabled
+        ),
+        "breakout_exhaustion_max_extension_atr": (
+            settings.breakout_exhaustion_max_extension_atr
+        ),
         "overextension_min_band_overshoot_atr": (
             settings.overextension_min_band_overshoot_atr
         ),
@@ -354,6 +390,19 @@ async def get_config():
         "max_open_positions": settings.max_open_positions,
         "default_lot_size": settings.default_lot_size,
         "confidence_threshold": settings.confidence_threshold,
+        "failed_thesis_reversal_enabled": settings.failed_thesis_reversal_enabled,
+        "failed_thesis_reversal_min_confidence": (
+            settings.failed_thesis_reversal_min_confidence
+        ),
+        "failed_thesis_reversal_max_age_bars": (
+            settings.failed_thesis_reversal_max_age_bars
+        ),
+        "failed_thesis_reversal_min_m5_adx": (
+            settings.failed_thesis_reversal_min_m5_adx
+        ),
+        "failed_thesis_reversal_min_m15_adx": (
+            settings.failed_thesis_reversal_min_m15_adx
+        ),
         "llm_provider": settings.llm_provider,
         "decision_model": settings.decision_model,
         "local_llm_model": settings.local_llm_model,
@@ -366,6 +415,7 @@ async def get_config():
         "local_llm_top_p": settings.local_llm_top_p,
         "local_llm_seed": settings.local_llm_seed,
         "local_llm_context_size": settings.local_llm_context_size,
+        "local_llm_max_tokens": settings.local_llm_max_tokens,
         "local_llm_timeout": settings.local_llm_timeout,
         "local_llm_max_retries": settings.local_llm_max_retries,
         "local_llm_structured_output": settings.local_llm_structured_output,
@@ -374,6 +424,9 @@ async def get_config():
         "openai_configured": bool(settings.openai_api_key),
         "llm_max_concurrency": settings.llm_max_concurrency,
         "llm_entry_candidates_per_bar": settings.llm_entry_candidates_per_bar,
+        "deterministic_entry_fast_path_enabled": (
+            settings.deterministic_entry_fast_path_enabled
+        ),
         "max_spread_pips": settings.max_spread_pips,
         "max_crypto_spread_bps": settings.max_crypto_spread_bps,
         "max_spread_to_stop_pct": settings.max_spread_to_stop_pct,
@@ -418,20 +471,29 @@ async def get_config():
         "auto_close_loss_enabled": settings.auto_close_loss_enabled,
         "auto_close_loss_usd": settings.auto_close_loss_usd,
         "fast_exit_review_enabled": settings.fast_exit_review_enabled,
+        "exit_model_confirmation_enabled": (
+            settings.exit_model_confirmation_enabled
+        ),
         "position_exit_review_timeframe": settings.position_exit_review_timeframe,
         "micro_profit_protection_enabled": (
             settings.micro_profit_protection_enabled
         ),
-        "early_profit_lock_enabled": settings.early_profit_lock_enabled,
-        "early_profit_lock_trigger_usd": settings.early_profit_lock_trigger_usd,
-        "early_profit_lock_floor_usd": settings.early_profit_lock_floor_usd,
         "profit_lock_enabled": settings.profit_lock_enabled,
         "profit_lock_trigger_r": settings.profit_lock_trigger_r,
-        "profit_lock_min_live_fraction": settings.profit_lock_min_live_fraction,
         "profit_lock_trigger_usd": settings.profit_lock_trigger_usd,
         "profit_lock_floor_usd": settings.profit_lock_floor_usd,
+        "profit_lock_mid_trigger_r": settings.profit_lock_mid_trigger_r,
+        "profit_lock_mid_trigger_usd": settings.profit_lock_mid_trigger_usd,
+        "profit_lock_mid_fraction": settings.profit_lock_mid_fraction,
+        "profit_lock_final_trigger_usd": (
+            settings.profit_lock_final_trigger_usd
+        ),
+        "profit_lock_final_floor_usd": settings.profit_lock_final_floor_usd,
         "profit_giveback_enabled": settings.profit_giveback_enabled,
         "profit_giveback_trigger_r": settings.profit_giveback_trigger_r,
+        "profit_giveback_close_min_r": (
+            settings.profit_giveback_close_min_r
+        ),
         "profit_giveback_trigger_usd": settings.profit_giveback_trigger_usd,
         "profit_giveback_fraction": settings.profit_giveback_fraction,
         "breakeven_trigger_r": settings.breakeven_trigger_r,
@@ -457,6 +519,9 @@ async def get_config():
             settings.breakout_min_displacement_atr
         ),
         "entry_adx_decline_tolerance": settings.entry_adx_decline_tolerance,
+        "entry_aligned_adx_decline_tolerance": (
+            settings.entry_aligned_adx_decline_tolerance
+        ),
         "entry_min_h4_adx": settings.entry_min_h4_adx,
         "overextension_rsi_high": settings.overextension_rsi_high,
         "overextension_rsi_low": settings.overextension_rsi_low,
@@ -495,6 +560,7 @@ async def save_config(body: dict):
         allowed = {
             "TRADING_SYMBOLS", "MARKET_CANDIDATE_SYMBOLS", "RISK_PERCENT",
             "DYNAMIC_MARKET_SELECTION_ENABLED", "DYNAMIC_MARKET_MAX_SYMBOLS",
+            "LLM_ENTRY_CANDIDATES_PER_BAR",
             "SHADOW_SYMBOLS",
             "MARKET_SELECTION_REFRESH_SECONDS", "ADAPTIVE_REVERSAL_ENABLED",
             "ADAPTIVE_REVERSAL_MIN_ADX", "MARKET_SHOCK_RANGE_ATR",
@@ -502,6 +568,11 @@ async def save_config(body: dict):
             "AUTO_START_MONITORING", "ANALYSIS_INTERVAL_SECONDS",
             "DECISION_POLL_SECONDS",
             "MAX_OPEN_POSITIONS", "DEFAULT_LOT_SIZE", "CONFIDENCE_THRESHOLD",
+            "FAILED_THESIS_REVERSAL_ENABLED",
+            "FAILED_THESIS_REVERSAL_MIN_CONFIDENCE",
+            "FAILED_THESIS_REVERSAL_MAX_AGE_BARS",
+            "FAILED_THESIS_REVERSAL_MIN_M5_ADX",
+            "FAILED_THESIS_REVERSAL_MIN_M15_ADX",
             "MAX_SPREAD_PIPS", "MAX_CRYPTO_SPREAD_BPS", "MAX_SPREAD_TO_STOP_PCT",
             "MAX_ORDER_DEVIATION_POINTS", "FX_ROUND_TURN_COST_USD_PER_LOT",
             "CRYPTO_ROUND_TURN_COST_USD_PER_LOT", "CFD_ROUND_TURN_COST_USD_PER_LOT",
@@ -520,11 +591,13 @@ async def save_config(body: dict):
             "AUTO_CLOSE_TARGET_PROFIT_USD", "AUTO_CLOSE_TARGET_LOSS_ENABLED",
             "AUTO_CLOSE_TARGET_LOSS_USD", "REQUIRE_NEWS_CALENDAR",
             "FAST_EXIT_REVIEW_ENABLED", "POSITION_EXIT_REVIEW_TIMEFRAME",
-            "EARLY_PROFIT_LOCK_ENABLED", "EARLY_PROFIT_LOCK_TRIGGER_USD",
-            "EARLY_PROFIT_LOCK_FLOOR_USD",
             "PROFIT_LOCK_ENABLED", "PROFIT_LOCK_TRIGGER_R",
             "PROFIT_LOCK_TRIGGER_USD", "PROFIT_LOCK_FLOOR_USD",
+            "PROFIT_LOCK_MID_TRIGGER_R", "PROFIT_LOCK_MID_TRIGGER_USD",
+            "PROFIT_LOCK_MID_FRACTION", "PROFIT_LOCK_FINAL_TRIGGER_USD",
+            "PROFIT_LOCK_FINAL_FLOOR_USD",
             "PROFIT_GIVEBACK_ENABLED", "PROFIT_GIVEBACK_TRIGGER_R",
+            "PROFIT_GIVEBACK_CLOSE_MIN_R",
             "PROFIT_GIVEBACK_TRIGGER_USD", "PROFIT_GIVEBACK_FRACTION",
             "BREAKEVEN_TRIGGER_R", "BREAKEVEN_BUFFER_PIPS",
             "TRAILING_TRIGGER_R", "TRAILING_DISTANCE_R",
@@ -532,8 +605,13 @@ async def save_config(body: dict):
             "PLAN_MAX_COST_TARGET_EXTENSION_R", "PLAN_TARGET_BUFFER_ATR",
             "REQUIRE_TECHNICAL_TARGET",
             "ENTRY_MIN_ADX", "ENTRY_ADX_DECLINE_TOLERANCE",
+            "ENTRY_ALIGNED_ADX_DECLINE_TOLERANCE",
             "ENTRY_MIN_OPPOSING_DISTANCE_ATR",
-            "ENTRY_MAX_CANDLE_RANGE_ATR", "BREAKOUT_MIN_DISPLACEMENT_ATR",
+            "ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR",
+            "ENTRY_MAX_CANDLE_RANGE_ATR",
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE",
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR",
+            "BREAKOUT_MIN_DISPLACEMENT_ATR",
             "ENTRY_MIN_H4_ADX",
             "OVEREXTENSION_RSI_HIGH", "OVEREXTENSION_RSI_LOW",
             "ENTRY_REQUIRE_ADX_RISING", "SAME_THESIS_REENTRY_MIN_BARS",
@@ -551,6 +629,10 @@ async def save_config(body: dict):
         numeric_ranges = {
             "RISK_PERCENT": (0.05, 20.0), "MAX_OPEN_POSITIONS": (1, 10),
             "DEFAULT_LOT_SIZE": (0.01, 100.0), "CONFIDENCE_THRESHOLD": (0.5, 0.99),
+            "FAILED_THESIS_REVERSAL_MIN_CONFIDENCE": (0.60, 0.99),
+            "FAILED_THESIS_REVERSAL_MAX_AGE_BARS": (1, 36),
+            "FAILED_THESIS_REVERSAL_MIN_M5_ADX": (0.0, 60.0),
+            "FAILED_THESIS_REVERSAL_MIN_M15_ADX": (0.0, 60.0),
             "MAX_SPREAD_PIPS": (0.1, 1000.0), "MIN_RISK_REWARD_RATIO": (1.0, 10.0),
             "MAX_CRYPTO_SPREAD_BPS": (0.1, 1000.0),
             "MAX_SPREAD_TO_STOP_PCT": (1.0, 100.0),
@@ -564,8 +646,12 @@ async def save_config(body: dict):
             "PLAN_TARGET_BUFFER_ATR": (0.0, 1.0),
             "ENTRY_MIN_ADX": (15.0, 60.0),
             "ENTRY_ADX_DECLINE_TOLERANCE": (0.0, 5.0),
+            "ENTRY_ALIGNED_ADX_DECLINE_TOLERANCE": (0.0, 5.0),
             "ENTRY_MIN_OPPOSING_DISTANCE_ATR": (0.0, 5.0),
+            "ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR": (0.0, 5.0),
             "ENTRY_MAX_CANDLE_RANGE_ATR": (0.5, 5.0),
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE": (0.5, 1.0),
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR": (0.5, 5.0),
             "BREAKOUT_MIN_DISPLACEMENT_ATR": (0.0, 1.0),
             "ENTRY_MIN_H4_ADX": (0.0, 60.0),
             "OVEREXTENSION_RSI_HIGH": (50.0, 100.0),
@@ -582,12 +668,16 @@ async def save_config(body: dict):
             "LOSS_STREAK_PAUSE_HOURS": (0, 720),
             "AUTO_CLOSE_TARGET_PROFIT_USD": (0.01, 100000.0),
             "AUTO_CLOSE_TARGET_LOSS_USD": (0.01, 100000.0),
-            "EARLY_PROFIT_LOCK_TRIGGER_USD": (0.01, 100000.0),
-            "EARLY_PROFIT_LOCK_FLOOR_USD": (0.0, 100000.0),
             "PROFIT_LOCK_TRIGGER_R": (0.1, 10.0),
-            "PROFIT_LOCK_TRIGGER_USD": (0.0, 100000.0),
+            "PROFIT_LOCK_TRIGGER_USD": (0.01, 100000.0),
             "PROFIT_LOCK_FLOOR_USD": (0.0, 100000.0),
+            "PROFIT_LOCK_MID_TRIGGER_R": (0.1, 10.0),
+            "PROFIT_LOCK_MID_TRIGGER_USD": (0.01, 100000.0),
+            "PROFIT_LOCK_MID_FRACTION": (0.05, 0.95),
+            "PROFIT_LOCK_FINAL_TRIGGER_USD": (0.01, 100000.0),
+            "PROFIT_LOCK_FINAL_FLOOR_USD": (0.0, 100000.0),
             "PROFIT_GIVEBACK_TRIGGER_R": (0.1, 10.0),
+            "PROFIT_GIVEBACK_CLOSE_MIN_R": (0.1, 10.0),
             "PROFIT_GIVEBACK_TRIGGER_USD": (0.0, 100000.0),
             "PROFIT_GIVEBACK_FRACTION": (0.05, 0.95),
             "BREAKEVEN_TRIGGER_R": (0.1, 10.0),
@@ -609,6 +699,7 @@ async def save_config(body: dict):
             "LOCAL_LLM_CONTEXT_SIZE", "LLM_MAX_CONCURRENCY", "MAX_ORDER_DEVIATION_POINTS",
             "DYNAMIC_MARKET_MAX_SYMBOLS",
             "SAME_THESIS_REENTRY_MIN_BARS",
+            "FAILED_THESIS_REVERSAL_MAX_AGE_BARS",
         }
         for key, bounds in numeric_ranges.items():
             if key in updates:
@@ -623,24 +714,70 @@ async def save_config(body: dict):
                     )
                 if key in integer_keys and not value.is_integer():
                     return JSONResponse({"error": f"{key} must be a whole number"}, status_code=422)
-        early_trigger = float(
+        first_trigger_r = float(
+            updates.get("PROFIT_LOCK_TRIGGER_R", settings.profit_lock_trigger_r)
+        )
+        first_trigger_usd = float(
             updates.get(
-                "EARLY_PROFIT_LOCK_TRIGGER_USD",
-                settings.early_profit_lock_trigger_usd,
+                "PROFIT_LOCK_TRIGGER_USD", settings.profit_lock_trigger_usd
             )
         )
-        early_floor = float(
+        first_floor_usd = float(
+            updates.get("PROFIT_LOCK_FLOOR_USD", settings.profit_lock_floor_usd)
+        )
+        mid_trigger_r = float(
             updates.get(
-                "EARLY_PROFIT_LOCK_FLOOR_USD",
-                settings.early_profit_lock_floor_usd,
+                "PROFIT_LOCK_MID_TRIGGER_R",
+                settings.profit_lock_mid_trigger_r,
             )
         )
-        if early_floor >= early_trigger:
+        mid_trigger_usd = float(
+            updates.get(
+                "PROFIT_LOCK_MID_TRIGGER_USD",
+                settings.profit_lock_mid_trigger_usd,
+            )
+        )
+        final_trigger_usd = float(
+            updates.get(
+                "PROFIT_LOCK_FINAL_TRIGGER_USD",
+                settings.profit_lock_final_trigger_usd,
+            )
+        )
+        final_floor_usd = float(
+            updates.get(
+                "PROFIT_LOCK_FINAL_FLOOR_USD",
+                settings.profit_lock_final_floor_usd,
+            )
+        )
+        if first_floor_usd >= first_trigger_usd:
             return JSONResponse(
                 {
                     "error": (
-                        "EARLY_PROFIT_LOCK_FLOOR_USD must be lower than "
-                        "EARLY_PROFIT_LOCK_TRIGGER_USD to preserve headroom"
+                        "PROFIT_LOCK_FLOOR_USD must be lower than "
+                        "PROFIT_LOCK_TRIGGER_USD to preserve headroom"
+                    )
+                },
+                status_code=422,
+            )
+        if mid_trigger_r < first_trigger_r or mid_trigger_usd < first_trigger_usd:
+            return JSONResponse(
+                {
+                    "error": (
+                        "Mid profit-lock triggers cannot be lower than the "
+                        "first-tier triggers"
+                    )
+                },
+                status_code=422,
+            )
+        if (
+            final_trigger_usd < mid_trigger_usd
+            or final_floor_usd >= final_trigger_usd
+        ):
+            return JSONResponse(
+                {
+                    "error": (
+                        "Final profit-lock trigger must follow the mid tier "
+                        "and remain above its protected floor"
                     )
                 },
                 status_code=422,
@@ -684,7 +821,7 @@ async def save_config(body: dict):
                 {
                     "error": (
                         "LOCAL_LLM_REQUIRED_QUANTIZATION must be "
-                        "AUTO, Q6_K, or Q8_0"
+                        "AUTO, Q4_K_M, Q6_K, or Q8_0"
                     )
                 },
                 status_code=422,
@@ -697,9 +834,10 @@ async def save_config(body: dict):
             "AUTO_CLOSE_TARGET_PROFIT_ENABLED", "AUTO_CLOSE_TARGET_LOSS_ENABLED",
             "REQUIRE_NEWS_CALENDAR",
             "DYNAMIC_MARKET_SELECTION_ENABLED", "ADAPTIVE_REVERSAL_ENABLED",
+            "FAILED_THESIS_REVERSAL_ENABLED",
             "ENTRY_REQUIRE_ADX_RISING",
             "RETEST_CONTINUATION_ENABLED",
-            "FAST_EXIT_REVIEW_ENABLED", "EARLY_PROFIT_LOCK_ENABLED",
+            "FAST_EXIT_REVIEW_ENABLED",
             "MICRO_PROFIT_PROTECTION_ENABLED", "PROFIT_LOCK_ENABLED",
             "PROFIT_GIVEBACK_ENABLED",
         }
@@ -709,6 +847,67 @@ async def save_config(body: dict):
         )
         if invalid_boolean:
             return JSONResponse({"error": f"{invalid_boolean} must be true or false"}, status_code=422)
+        reversal_enabled = updates.get(
+            "FAILED_THESIS_REVERSAL_ENABLED",
+            str(settings.failed_thesis_reversal_enabled),
+        ).lower() == "true"
+        reversal_min_confidence = float(
+            updates.get(
+                "FAILED_THESIS_REVERSAL_MIN_CONFIDENCE",
+                settings.failed_thesis_reversal_min_confidence,
+            )
+        )
+        global_confidence = float(
+            updates.get("CONFIDENCE_THRESHOLD", settings.confidence_threshold)
+        )
+        if reversal_enabled and reversal_min_confidence >= global_confidence:
+            return JSONResponse(
+                {
+                    "error": (
+                        "FAILED_THESIS_REVERSAL_MIN_CONFIDENCE must be lower "
+                        "than CONFIDENCE_THRESHOLD when the exception is enabled"
+                    )
+                },
+                status_code=422,
+            )
+        chase_confidence = float(
+            updates.get(
+                "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE",
+                settings.entry_strong_alignment_chase_min_confidence,
+            )
+        )
+        if chase_confidence < global_confidence:
+            return JSONResponse(
+                {
+                    "error": (
+                        "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE must be "
+                        "at least CONFIDENCE_THRESHOLD"
+                    )
+                },
+                status_code=422,
+            )
+        normal_chase_limit = float(
+            updates.get(
+                "ENTRY_MAX_CANDLE_RANGE_ATR",
+                settings.entry_max_candle_range_atr,
+            )
+        )
+        aligned_chase_limit = float(
+            updates.get(
+                "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR",
+                settings.entry_strong_alignment_chase_max_extension_atr,
+            )
+        )
+        if aligned_chase_limit < normal_chase_limit:
+            return JSONResponse(
+                {
+                    "error": (
+                        "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR must "
+                        "be at least ENTRY_MAX_CANDLE_RANGE_ATR"
+                    )
+                },
+                status_code=422,
+            )
         if (
             "POSITION_EXIT_REVIEW_TIMEFRAME" in updates
             and updates["POSITION_EXIT_REVIEW_TIMEFRAME"].upper()

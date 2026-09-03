@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from app_config.settings import settings
+from core.entry_momentum import aligned_structure_allows_adx_decline
 from risk.execution_costs import estimate_execution_risk
 from risk.instruments import downside_risk_usd, is_crypto_symbol, validate_spread
 
@@ -148,6 +149,136 @@ class RiskManager:
         return normalized if normalized in {"BULLISH", "BEARISH"} else "NEUTRAL"
 
     @classmethod
+    def qualify_failed_thesis_reversal(
+        cls,
+        action: str,
+        confidence: float,
+        trade_history: Optional[List[Dict[str, Any]]],
+        m5_analysis: Optional[Dict[str, Any]],
+        m15_analysis: Optional[Dict[str, Any]],
+    ) -> Tuple[bool, str]:
+        """Qualify a lower-confidence reversal using broker and chart facts.
+
+        The exception exists only to pass a 60-69% model direction into the
+        normal planner and risk pipeline after the strategy's latest thesis
+        demonstrably failed. It cannot approve an order by itself.
+        """
+        if not settings.failed_thesis_reversal_enabled:
+            return False, "failed-thesis reversal handling is disabled"
+
+        normalized_action = str(action).upper()
+        expected = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(
+            normalized_action
+        )
+        opposite = {"BUY": "SELL", "SELL": "BUY"}.get(normalized_action)
+        if expected is None:
+            return False, "entry direction is invalid"
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError):
+            return False, "confidence is invalid"
+        if normalized_confidence > 1.0:
+            normalized_confidence /= 100.0
+        if not (
+            settings.failed_thesis_reversal_min_confidence
+            <= normalized_confidence
+            < settings.confidence_threshold
+        ):
+            return False, "confidence is outside the bounded reversal window"
+
+        closed = []
+        for trade in trade_history or []:
+            closed_at = _parse_utc_datetime(
+                trade.get("close_time") or trade.get("time")
+            )
+            try:
+                pnl = float(
+                    trade.get("net_profit", trade.get("profit", 0.0)) or 0.0
+                )
+            except (TypeError, ValueError):
+                continue
+            direction = str(
+                trade.get("direction", trade.get("action", ""))
+            ).upper()
+            if closed_at is not None and math.isfinite(pnl):
+                closed.append((closed_at, pnl, direction))
+        if not closed:
+            return False, "no broker-confirmed closed thesis exists"
+        closed_at, pnl, prior_direction = max(closed, key=lambda item: item[0])
+        if pnl >= 0 or prior_direction != opposite:
+            return False, "latest closed thesis was not an opposite-direction loss"
+
+        analysis_at = _parse_utc_datetime((m5_analysis or {}).get("timestamp"))
+        if analysis_at is None or analysis_at <= closed_at:
+            return False, "reversal candle does not follow the failed thesis"
+        max_age = timedelta(
+            minutes=5 * settings.failed_thesis_reversal_max_age_bars
+        )
+        if analysis_at - closed_at > max_age:
+            return False, "failed thesis is outside the bounded reversal window"
+
+        if cls._trend_direction(m5_analysis) != expected:
+            return False, "M5 direction does not confirm the reversal"
+        if cls._trend_direction(m15_analysis) != expected:
+            return False, "M15 direction does not confirm the reversal"
+
+        structure = (m5_analysis or {}).get("market_structure", {}) or {}
+        events = [
+            event
+            for event in structure.get("structure_events", []) or []
+            if isinstance(event, dict)
+            and str(event.get("direction", "")).upper() == expected
+            and str(event.get("type", "")).upper() in {"BOS", "CHOCH"}
+        ]
+        fresh_event = any(
+            (event_at := _parse_utc_datetime(event.get("time"))) is not None
+            and event_at > closed_at
+            for event in events
+        )
+        breakout = str(structure.get("breakout_status", "")).upper()
+        has_breakout = expected in breakout and "BREAKOUT" in breakout
+        if not (fresh_event or has_breakout):
+            return False, "no fresh directional BOS, CHoCH, or breakout exists"
+
+        patterns = [
+            str(pattern).upper()
+            for pattern in structure.get("candlestick_patterns", []) or []
+        ]
+        if not any(expected in pattern for pattern in patterns):
+            return False, "completed M5 candle lacks a directional pattern"
+
+        def indicator(analysis: Optional[Dict[str, Any]], key: str) -> float:
+            try:
+                value = float(
+                    (analysis or {}).get("indicators", {}).get(key)
+                )
+            except (TypeError, ValueError):
+                return math.nan
+            return value if math.isfinite(value) else math.nan
+
+        m5_adx = indicator(m5_analysis, "adx_14")
+        m15_adx = indicator(m15_analysis, "adx_14")
+        adx_delta = indicator(m5_analysis, "adx_delta")
+        if (
+            not math.isfinite(m5_adx)
+            or m5_adx < settings.failed_thesis_reversal_min_m5_adx
+        ):
+            return False, "M5 reversal momentum is insufficient"
+        if (
+            not math.isfinite(m15_adx)
+            or m15_adx < settings.failed_thesis_reversal_min_m15_adx
+        ):
+            return False, "M15 reversal momentum is insufficient"
+        if not math.isfinite(adx_delta) or adx_delta < 0.0:
+            return False, "M5 reversal momentum is not strengthening"
+
+        return (
+            True,
+            f"latest {prior_direction} thesis lost {pnl:.2f}; fresh "
+            f"{normalized_action} M5/M15 reversal confirmed",
+        )
+
+    @classmethod
     def _resolve_strategy_mode(
         cls,
         action: str,
@@ -167,6 +298,14 @@ class RiskManager:
             "CONFIRMED_REVERSAL",
         }
         if supplied in allowed:
+            return supplied
+        if (
+            supplied == "FAILED_THESIS_REVERSAL"
+            and str(
+                (llm_decision.get("_strategy") or {}).get("source", "")
+            ).upper()
+            == "DETERMINISTIC_FAILED_THESIS_REVERSAL"
+        ):
             return supplied
 
         expected = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(
@@ -358,6 +497,7 @@ class RiskManager:
         confluence_factors: Optional[Dict[str, bool]] = None,
         strategy_mode: str = "",
         market_snapshot: Any = None,
+        decision_confidence: float = 0.0,
     ) -> Tuple[bool, str]:
         """Reject weak or overextended entries using deterministic evidence.
 
@@ -393,6 +533,9 @@ class RiskManager:
             "H4": direction(h4_analysis),
         }
         range_mode = str(strategy_mode).upper() == "RANGE_REVERSION"
+        failed_thesis_reversal = (
+            str(strategy_mode).upper() == "FAILED_THESIS_REVERSAL"
+        )
         m5_structure = structure(m5_analysis)
         range_setup = m5_structure.get("range_reversion", {}) or {}
         if range_mode and not (
@@ -435,7 +578,10 @@ class RiskManager:
         for timeframe in (() if range_mode else ("M5", "M15", "H1")):
             if (
                 timeframe == "H1"
-                and str(strategy_mode).upper() == "CONFIRMED_REVERSAL"
+                and str(strategy_mode).upper() in {
+                    "CONFIRMED_REVERSAL",
+                    "FAILED_THESIS_REVERSAL",
+                }
             ):
                 continue
             if timeframe == "M15" and neutral_m15_bridge:
@@ -473,6 +619,33 @@ class RiskManager:
         m15_adx = adx(m15_analysis)
         h1_adx = adx(h1_analysis)
         h4_adx = adx(h4_analysis)
+        if failed_thesis_reversal:
+            patterns = [
+                str(pattern).upper()
+                for pattern in m5_structure.get("candlestick_patterns", []) or []
+            ]
+            try:
+                reversal_adx_delta = float(
+                    (m5_analysis or {}).get("indicators", {}).get("adx_delta")
+                )
+            except (TypeError, ValueError):
+                reversal_adx_delta = math.nan
+            if not (
+                directions["M5"] == expected
+                and directions["M15"] == expected
+                and (has_bos or has_choch or has_breakout)
+                and any(expected in pattern for pattern in patterns)
+                and m5_adx >= settings.failed_thesis_reversal_min_m5_adx
+                and m15_adx >= settings.failed_thesis_reversal_min_m15_adx
+                and math.isfinite(reversal_adx_delta)
+                and reversal_adx_delta >= 0.0
+            ):
+                return (
+                    False,
+                    "REJECTED [Failed-Thesis Reversal]: Deterministic M5/M15 "
+                    "direction, fresh structure, directional candle pattern, "
+                    "and strengthening ADX confirmation are required.",
+                )
         lower_timeframe_momentum_confirms = (
             (has_retest or has_bos)
             and m5_adx >= settings.breakout_min_adx
@@ -504,13 +677,26 @@ class RiskManager:
                 adx_delta = math.nan
             decline_limit = -settings.entry_adx_decline_tolerance
             if math.isfinite(adx_delta) and adx_delta < decline_limit:
-                return (
-                    False,
-                    f"REJECTED [ADX Direction]: M5 ADX is falling "
-                    f"({adx_delta:+.2f}); allowed noise is "
-                    f"{settings.entry_adx_decline_tolerance:.2f}. Wait for "
-                    "momentum to stabilize.",
+                aligned_exception = aligned_structure_allows_adx_decline(
+                    m5_analysis,
+                    m15_analysis,
+                    h1_analysis,
+                    action=action,
+                    max_decline=(
+                        settings.entry_aligned_adx_decline_tolerance
+                    ),
+                    min_m5_adx=settings.breakout_min_adx,
+                    min_m15_adx=settings.confirmation_min_adx,
                 )
+                if not aligned_exception:
+                    return (
+                        False,
+                        f"REJECTED [ADX Direction]: M5 ADX is falling "
+                        f"({adx_delta:+.2f}); allowed noise is "
+                        f"{settings.entry_adx_decline_tolerance:.2f}. A "
+                        "bounded exception requires fresh M5 structure with "
+                        "strong, aligned M15/H1 confirmation.",
+                    )
 
         if str(strategy_mode).upper() == "CONFIRMED_REVERSAL":
             if not has_choch or not (has_bos or m15_events or has_breakout):
@@ -632,20 +818,64 @@ class RiskManager:
             if directional_metrics
             else candle_range_atr
         )
-        if (
+        try:
+            normalized_confidence = float(decision_confidence)
+        except (TypeError, ValueError):
+            normalized_confidence = 0.0
+        if normalized_confidence > 1.0:
+            normalized_confidence /= 100.0
+        confirmed_choch = bool(has_choch and (m15_events or has_breakout))
+        structurally_anchored_chase = bool(
+            has_bos or has_retest or confirmed_choch
+        )
+        bounded_aligned_chase = bool(
+            str(strategy_mode).upper()
+            in {"TREND_CONTINUATION", "PULLBACK_RESUMPTION"}
+            and structurally_anchored_chase
+            and all(
+                directions[timeframe] == expected
+                for timeframe in ("M5", "M15", "H1", "H4")
+            )
+            and normalized_confidence
+            >= settings.entry_strong_alignment_chase_min_confidence
+            and m5_adx >= settings.breakout_min_adx
+            and m15_adx >= settings.confirmation_min_adx
+            and h1_adx >= settings.breakout_macro_min_adx
+            and h4_adx >= settings.entry_min_h4_adx
+            and math.isfinite(directional_extension_atr)
+            and directional_extension_atr
+            <= settings.entry_strong_alignment_chase_max_extension_atr
+            + 1e-12
+        )
+        extended_impulse = bool(
             settings.entry_max_candle_range_atr > 0
             and math.isfinite(candle_range_atr)
             and candle_range_atr > settings.entry_max_candle_range_atr
             and math.isfinite(directional_extension_atr)
             and directional_extension_atr > settings.entry_max_candle_range_atr
-        ):
+        )
+        if extended_impulse and bounded_aligned_chase:
+            logger.warning(
+                "Allowing bounded aligned %s continuation: %.2f ATR "
+                "extension, confidence %.0f%%, exact M5/M15/H1/H4 alignment.",
+                action,
+                directional_extension_atr,
+                normalized_confidence * 100.0,
+            )
+        if extended_impulse and not bounded_aligned_chase:
             return (
                 False,
                 f"REJECTED [Entry Chase]: Completed M5 candle extends "
                 f"{directional_extension_atr:.2f} ATR in the entry direction "
                 f"({candle_range_atr:.2f} ATR full range); maximum is "
-                f"{settings.entry_max_candle_range_atr:.2f} ATR. Wait for a "
-                "retest instead of entering after an extended impulse.",
+                f"{settings.entry_max_candle_range_atr:.2f} ATR. The bounded "
+                "continuation exception requires a fresh BOS/retest/confirmed "
+                "CHoCH, exact M5/M15/H1/H4 alignment, strong momentum, "
+                f"confidence >= "
+                f"{settings.entry_strong_alignment_chase_min_confidence:.0%}, "
+                f"and extension <= "
+                f"{settings.entry_strong_alignment_chase_max_extension_atr:.2f} "
+                "ATR.",
             )
         try:
             current_price = float(indicators.get("current_price"))
@@ -656,9 +886,11 @@ class RiskManager:
         # the live bid so the BUY-side spread is not misclassified as price
         # movement.  Spread and execution cost are validated separately.
         market_price = current_price
+        live_bid = live_ask = math.nan
         try:
             metrics = getattr(market_snapshot, "metrics")
             live_bid = float(getattr(metrics, "bid"))
+            live_ask = float(getattr(metrics, "ask"))
             if math.isfinite(live_bid) and live_bid > 0:
                 market_price = live_bid
         except (AttributeError, TypeError, ValueError):
@@ -678,13 +910,68 @@ class RiskManager:
             if directional_drift > (
                 atr * settings.entry_max_execution_drift_atr + 1e-12
             ):
+                try:
+                    normalized_confidence = float(decision_confidence)
+                except (TypeError, ValueError):
+                    normalized_confidence = 0.0
+                if normalized_confidence > 1.0:
+                    normalized_confidence /= 100.0
+                drift_atr = directional_drift / atr
+                strong_alignment_drift = (
+                    str(strategy_mode).upper()
+                    in {"TREND_CONTINUATION", "PULLBACK_RESUMPTION"}
+                    and all(value == expected for value in directions.values())
+                    and normalized_confidence
+                    >= settings.entry_strong_alignment_min_confidence
+                    and m5_adx >= settings.breakout_min_adx
+                    and m15_adx >= settings.confirmation_min_adx
+                    and h1_adx >= settings.breakout_macro_min_adx
+                    and h4_adx >= settings.entry_min_h4_adx
+                    and drift_atr
+                    <= settings.entry_strong_alignment_max_execution_drift_atr
+                    + 1e-12
+                )
+                if not strong_alignment_drift:
+                    return (
+                        False,
+                        f"REJECTED [Execution Drift]: Live bid moved "
+                        f"{drift_atr:.2f} ATR beyond the analyzed M5 close; "
+                        f"normal maximum is "
+                        f"{settings.entry_max_execution_drift_atr:.2f} ATR. "
+                        "The bounded strong-alignment exception requires "
+                        f"confidence >= "
+                        f"{settings.entry_strong_alignment_min_confidence:.0%}, "
+                        "exact M5/M15/H1/H4 alignment, strong momentum, and "
+                        f"drift <= "
+                        f"{settings.entry_strong_alignment_max_execution_drift_atr:.2f} "
+                        "ATR. Wait for a fresh candle or retest.",
+                    )
+        executable_price = live_ask if expected == "BULLISH" else live_bid
+        if (
+            math.isfinite(current_price)
+            and math.isfinite(executable_price)
+            and executable_price > 0
+            and math.isfinite(atr)
+            and atr > 0
+            and settings.entry_max_executable_premium_atr > 0
+        ):
+            executable_premium = (
+                executable_price - current_price
+                if expected == "BULLISH"
+                else current_price - executable_price
+            )
+            if executable_premium > (
+                atr * settings.entry_max_executable_premium_atr + 1e-12
+            ):
+                quote_name = "ask" if expected == "BULLISH" else "bid"
                 return (
                     False,
-                    f"REJECTED [Execution Drift]: Live bid moved "
-                    f"{directional_drift / atr:.2f} ATR beyond the analyzed "
-                    f"M5 close; maximum is "
-                    f"{settings.entry_max_execution_drift_atr:.2f} ATR. "
-                    "Wait for a fresh candle or retest.",
+                    f"REJECTED [Executable Price]: Live {action} {quote_name} "
+                    f"is {executable_premium / atr:.2f} ATR beyond the "
+                    f"analyzed M5 close; maximum is "
+                    f"{settings.entry_max_executable_premium_atr:.2f} ATR. "
+                    "The setup may remain valid, but this quote is too late; "
+                    "wait for a retest or the next completed candle.",
                 )
         if (
             math.isfinite(market_price)
@@ -736,13 +1023,55 @@ class RiskManager:
                         opposing_distances.append(max(0.0, low - market_price))
                 opposing_label = "resistance/supply"
             nearest = min(opposing_distances) if opposing_distances else math.inf
-            minimum = atr * settings.entry_min_opposing_distance_atr
+            minimum_distance_atr = settings.entry_min_opposing_distance_atr
+            # A BOS by itself can be a late continuation signal.  When the
+            # completed entry candle has no independent timing evidence,
+            # require a little more room before resistance/supply (BUY) or
+            # support/demand (SELL).  Verified retests, confirmed CHoCH,
+            # directional patterns, FVG alignment, and nearby supportive
+            # structure keep the normal opposing-zone threshold.
+            factors = confluence_factors or {}
+            has_independent_confirmation = bool(
+                has_retest
+                or has_confirmed_choch
+                or factors.get("pattern_confluence")
+                or factors.get("fvg_alignment")
+                or factors.get("sup_res_proximity")
+            )
+            unconfirmed_bos = bool(
+                confluence_factors is not None
+                and has_bos
+                and not has_independent_confirmation
+            )
+            if unconfirmed_bos:
+                minimum_distance_atr = max(
+                    minimum_distance_atr,
+                    float(
+                        getattr(
+                            settings,
+                            "entry_unconfirmed_bos_min_opposing_distance_atr",
+                            minimum_distance_atr,
+                        )
+                    ),
+                )
+            minimum = atr * minimum_distance_atr
             if nearest < minimum:
+                gate = (
+                    "Opposing Zone - Unconfirmed BOS"
+                    if unconfirmed_bos
+                    else "Opposing Zone"
+                )
+                context = (
+                    "; BOS has no retest, directional pattern, FVG alignment, "
+                    "or nearby supportive structure"
+                    if unconfirmed_bos
+                    else ""
+                )
                 return (
                     False,
-                    f"REJECTED [Opposing Zone]: {action} is only "
+                    f"REJECTED [{gate}]: {action} is only "
                     f"{nearest / atr:.2f} ATR from {opposing_label}; minimum is "
-                    f"{settings.entry_min_opposing_distance_atr:.2f} ATR.",
+                    f"{minimum_distance_atr:.2f} ATR{context}.",
                 )
 
         stochastic = indicators.get("stochastic", {}) or {}
@@ -791,28 +1120,63 @@ class RiskManager:
         # winners when a directional candle pattern, verified retest, or an
         # actual H1/H4 structure event confirms the continuation; otherwise
         # wait for the retest instead of treating the BOS label as sufficient.
-        def _macro_structure_confirms(analysis: Optional[Dict[str, Any]]) -> bool:
+        def _macro_structure_confirms(
+            analysis: Optional[Dict[str, Any]],
+            max_age_minutes: float,
+        ) -> bool:
             macro = structure(analysis)
             macro_events = macro.get("structure_events", []) or []
-            event_confirms = any(
-                isinstance(event, dict)
-                and str(event.get("direction", "")).upper() == expected
-                and str(event.get("type", "")).upper() in {"BOS", "CHOCH"}
-                for event in macro_events
+            entry_time = _parse_utc_datetime(
+                (m5_analysis or {}).get("timestamp")
             )
-            macro_breakout = str(macro.get("breakout_status", "")).upper()
-            return event_confirms or (
-                expected in macro_breakout and "BREAKOUT" in macro_breakout
+            if entry_time is None:
+                return False
+            for event in macro_events:
+                if not (
+                    isinstance(event, dict)
+                    and str(event.get("direction", "")).upper() == expected
+                    and str(event.get("type", "")).upper() in {"BOS", "CHOCH"}
+                ):
+                    continue
+                event_time = _parse_utc_datetime(event.get("time"))
+                if event_time is None:
+                    continue
+                age_minutes = (entry_time - event_time).total_seconds() / 60.0
+                if -1.0 <= age_minutes <= max_age_minutes:
+                    return True
+            return False
+
+        severe_impulse_exhaustion = bool(
+            math.isfinite(stoch_k)
+            and math.isfinite(rsi)
+            and math.isfinite(directional_extension_atr)
+            and directional_extension_atr >= 0.50
+            and (
+                (
+                    expected == "BULLISH"
+                    and stoch_k >= max(92.0, settings.overextension_stoch_high)
+                    and rsi >= 55.0
+                )
+                or (
+                    expected == "BEARISH"
+                    and stoch_k <= min(8.0, settings.overextension_stoch_low)
+                    and rsi <= 45.0
+                )
             )
+        )
 
         exhausted_bos_breakout = (
             has_bos
             and has_breakout
             and not has_retest
             and not has_directional_pattern
-            and not _macro_structure_confirms(h1_analysis)
-            and not _macro_structure_confirms(h4_analysis)
-            and exhausted_momentum
+            and not _macro_structure_confirms(
+                h1_analysis, settings.entry_h1_structure_max_age_minutes
+            )
+            and not _macro_structure_confirms(
+                h4_analysis, settings.entry_h4_structure_max_age_minutes
+            )
+            and (exhausted_momentum or severe_impulse_exhaustion)
         )
         if exhausted_bos_breakout:
             return (
@@ -828,7 +1192,23 @@ class RiskManager:
             and not has_directional_pattern
             and exhausted_momentum
         )
-        if breakout_exhausted:
+        bounded_breakout_continuation = bool(
+            settings.breakout_exhaustion_continuation_enabled
+            and breakout_exhausted
+            and all(
+                directions[timeframe] == expected
+                for timeframe in ("M5", "M15", "H1", "H4")
+            )
+            and m5_adx >= settings.breakout_strong_lower_adx
+            and m15_adx >= settings.breakout_min_adx
+            and h1_adx >= settings.breakout_macro_min_adx
+            and h4_adx >= settings.entry_min_h4_adx
+            and math.isfinite(directional_extension_atr)
+            and settings.breakout_min_displacement_atr
+            <= directional_extension_atr
+            <= settings.breakout_exhaustion_max_extension_atr
+        )
+        if breakout_exhausted and not bounded_breakout_continuation:
             return (
                 False,
                 f"REJECTED [Overextension - Breakout Exhaustion]: {action} "
@@ -1069,6 +1449,24 @@ class RiskManager:
             h1_analysis,
             h4_analysis,
         )
+        if strategy_mode == "FAILED_THESIS_REVERSAL":
+            reversal_ok, reversal_detail = (
+                self.qualify_failed_thesis_reversal(
+                    action,
+                    llm_decision.get("confidence", 0.0),
+                    trade_history,
+                    m5_analysis,
+                    m15_analysis,
+                )
+            )
+            if not reversal_ok:
+                return RiskValidationResult(
+                    approved=False,
+                    reason=(
+                        "REJECTED [Failed-Thesis Reversal]: Broker-history "
+                        f"qualification failed ({reversal_detail})."
+                    ),
+                )
         if strategy_mode and not str(
             (llm_decision.get("_strategy") or {}).get("mode", "")
         ).strip():
@@ -1251,6 +1649,7 @@ class RiskManager:
             confluence_factors,
             strategy_mode,
             market_snapshot,
+            llm_decision.get("confidence", 0.0),
         )
         if not ok:
             return reject(msg)
@@ -1349,7 +1748,8 @@ class RiskManager:
             return reject(
                 (
                     f"REJECTED [Net R:R Ratio]: Execution-adjusted R:R of "
-                    f"{sizing['rr']:.2f} is below {settings.min_risk_reward_ratio:.2f}."
+                    f"{sizing['rr']:.4f} is below "
+                    f"{settings.min_risk_reward_ratio:.4f}."
                 )
             )
 

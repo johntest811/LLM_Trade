@@ -93,6 +93,12 @@ class AppConfig:
     local_llm_top_p: float = float(os.getenv("LOCAL_LLM_TOP_P", "0.8"))
     local_llm_seed: int = int(os.getenv("LOCAL_LLM_SEED", "42"))
     local_llm_context_size: int = int(os.getenv("LOCAL_LLM_CONTEXT_SIZE", "8192"))
+    # Trading decisions are a six-field JSON object, not long-form analysis.
+    # Bounding completion length materially reduces tail latency and prevents
+    # small local models from spending the entry window on hidden verbosity.
+    local_llm_max_tokens: int = max(
+        96, min(512, int(os.getenv("LOCAL_LLM_MAX_TOKENS", "220")))
+    )
     local_llm_timeout: float = float(os.getenv("LOCAL_LLM_TIMEOUT", "45.0"))
     local_llm_max_retries: int = int(os.getenv("LOCAL_LLM_MAX_RETRIES", "2"))
     local_llm_structured_output: bool = _bool("LOCAL_LLM_STRUCTURED_OUTPUT", True)
@@ -134,6 +140,13 @@ class AppConfig:
     # stale before execution.
     llm_entry_candidates_per_bar: int = max(
         1, min(12, int(os.getenv("LLM_ENTRY_CANDIDATES_PER_BAR", "3")))
+    )
+    # Strong, uniquely directional completed-candle setups may use the same
+    # deterministic policy as the rules provider before joining a serial local
+    # model queue. The decision still passes the normal planner, validation,
+    # scoring, risk, live-quote, margin, and broker execution gates.
+    deterministic_entry_fast_path_enabled: bool = _bool(
+        "DETERMINISTIC_ENTRY_FAST_PATH_ENABLED", False
     )
 
     @property
@@ -242,6 +255,34 @@ class AppConfig:
     max_tick_age_seconds: float = float(os.getenv("MAX_TICK_AGE_SECONDS", "10.0"))
     reconcile_interval_seconds: int = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "30"))
     confidence_threshold: float = float(os.getenv("CONFIDENCE_THRESHOLD", "0.70"))
+    # A narrowly bounded exception for a fresh, independently confirmed
+    # reversal after the strategy's latest same-symbol trade closed at a loss.
+    # This does not lower the global confidence gate or bypass RiskManager.
+    failed_thesis_reversal_enabled: bool = _bool(
+        "FAILED_THESIS_REVERSAL_ENABLED", True
+    )
+    failed_thesis_reversal_min_confidence: float = min(
+        confidence_threshold,
+        max(
+            0.60,
+            float(os.getenv("FAILED_THESIS_REVERSAL_MIN_CONFIDENCE", "0.60")),
+        ),
+    )
+    failed_thesis_reversal_max_age_bars: int = max(
+        1,
+        min(
+            36,
+            int(os.getenv("FAILED_THESIS_REVERSAL_MAX_AGE_BARS", "18")),
+        ),
+    )
+    failed_thesis_reversal_min_m5_adx: float = max(
+        0.0,
+        float(os.getenv("FAILED_THESIS_REVERSAL_MIN_M5_ADX", "25.0")),
+    )
+    failed_thesis_reversal_min_m15_adx: float = max(
+        0.0,
+        float(os.getenv("FAILED_THESIS_REVERSAL_MIN_M15_ADX", "19.1")),
+    )
     allow_strong_countertrend_entries: bool = _bool(
         "ALLOW_STRONG_COUNTERTREND_ENTRIES", False
     )
@@ -264,14 +305,95 @@ class AppConfig:
     entry_adx_decline_tolerance: float = max(
         0.0, float(os.getenv("ENTRY_ADX_DECLINE_TOLERANCE", "0.50"))
     )
+    entry_aligned_adx_decline_tolerance: float = max(
+        entry_adx_decline_tolerance,
+        float(
+            os.getenv(
+                "ENTRY_ALIGNED_ADX_DECLINE_TOLERANCE",
+                "1.50",
+            )
+        ),
+    )
     entry_min_opposing_distance_atr: float = float(
         os.getenv("ENTRY_MIN_OPPOSING_DISTANCE_ATR", "0.75")
+    )
+    entry_unconfirmed_bos_min_opposing_distance_atr: float = max(
+        entry_min_opposing_distance_atr,
+        float(
+            os.getenv(
+                "ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR",
+                "1.75",
+            )
+        ),
     )
     entry_max_candle_range_atr: float = max(
         0.0, float(os.getenv("ENTRY_MAX_CANDLE_RANGE_ATR", "1.50"))
     )
+    # Shadow outcomes show that a blanket 1.50 ATR anti-chase cutoff can miss
+    # valid continuations. Keep that normal cap, but permit a small extension
+    # only for high-confidence, fully aligned, structurally anchored setups.
+    entry_strong_alignment_chase_min_confidence: float = min(
+        1.0,
+        max(
+            confidence_threshold,
+            float(
+                os.getenv(
+                    "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE",
+                    "0.85",
+                )
+            ),
+        ),
+    )
+    entry_strong_alignment_chase_max_extension_atr: float = max(
+        entry_max_candle_range_atr,
+        float(
+            os.getenv(
+                "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR",
+                "2.00",
+            )
+        ),
+    )
     entry_max_execution_drift_atr: float = max(
         0.0, float(os.getenv("ENTRY_MAX_EXECUTION_DRIFT_ATR", "0.25"))
+    )
+    # Preserve the normal anti-chase cap while allowing a narrowly bounded
+    # continuation when every directional timeframe and momentum check agrees.
+    # Confidence, R:R, spread, shock, margin, and sizing gates still run.
+    entry_strong_alignment_max_execution_drift_atr: float = max(
+        entry_max_execution_drift_atr,
+        float(
+            os.getenv(
+                "ENTRY_STRONG_ALIGNMENT_MAX_EXECUTION_DRIFT_ATR",
+                "0.40",
+            )
+        ),
+    )
+    entry_strong_alignment_min_confidence: float = min(
+        1.0,
+        max(
+            0.0,
+            float(
+                os.getenv(
+                    "ENTRY_STRONG_ALIGNMENT_MIN_CONFIDENCE",
+                    "0.80",
+                )
+            ),
+        ),
+    )
+    # MT5 candles are bid based, but a BUY executes at ask.  This separate cap
+    # catches a late BUY whose ask (spread plus post-close movement) is already
+    # too far beyond the analyzed close without mislabelling spread as drift.
+    entry_max_executable_premium_atr: float = max(
+        0.0,
+        float(os.getenv("ENTRY_MAX_EXECUTABLE_PREMIUM_ATR", "0.50")),
+    )
+    entry_h1_structure_max_age_minutes: float = max(
+        5.0,
+        float(os.getenv("ENTRY_H1_STRUCTURE_MAX_AGE_MINUTES", "90")),
+    )
+    entry_h4_structure_max_age_minutes: float = max(
+        15.0,
+        float(os.getenv("ENTRY_H4_STRUCTURE_MAX_AGE_MINUTES", "300")),
     )
     breakout_min_displacement_atr: float = max(
         0.0, float(os.getenv("BREAKOUT_MIN_DISPLACEMENT_ATR", "0.10"))
@@ -288,6 +410,18 @@ class AppConfig:
     )
     breakout_strong_lower_adx: float = max(
         0.0, float(os.getenv("BREAKOUT_STRONG_LOWER_ADX", "30.0"))
+    )
+    # A raw breakout can remain tradable at oscillator extremes when the move
+    # is still compact, every directional timeframe agrees, and momentum is
+    # independently strong. This is deliberately narrower than disabling the
+    # exhaustion gate: late candles, opposing macro structure, stale quotes,
+    # nearby opposing zones, and outer-band chases remain blocked.
+    breakout_exhaustion_continuation_enabled: bool = _bool(
+        "BREAKOUT_EXHAUSTION_CONTINUATION_ENABLED", True
+    )
+    breakout_exhaustion_max_extension_atr: float = max(
+        breakout_min_displacement_atr,
+        float(os.getenv("BREAKOUT_EXHAUSTION_MAX_EXTENSION_ATR", "0.75")),
     )
     overextension_rsi_high: float = float(
         os.getenv("OVEREXTENSION_RSI_HIGH", "65.0")
@@ -427,6 +561,13 @@ class AppConfig:
     auto_close_loss_enabled: bool = _bool("AUTO_CLOSE_TARGET_LOSS_ENABLED", False)
     auto_close_loss_usd: float = float(os.getenv("AUTO_CLOSE_TARGET_LOSS_USD", "0.25"))
     fast_exit_review_enabled: bool = _bool("FAST_EXIT_REVIEW_ENABLED", True)
+    # Open-position exits are time-critical and already have deterministic
+    # M1/M5 reversal, profit-floor, break-even, trailing, and broker-SL paths.
+    # Keeping the slower model out of this lane avoids GPU contention and
+    # prevents a single semantic interpretation from closing a valid pullback.
+    exit_model_confirmation_enabled: bool = _bool(
+        "EXIT_MODEL_CONFIRMATION_ENABLED", False
+    )
     position_exit_review_timeframe: str = os.getenv(
         "POSITION_EXIT_REVIEW_TIMEFRAME", "M1"
     ).strip().upper()
@@ -435,31 +576,50 @@ class AppConfig:
     micro_profit_protection_enabled: bool = _bool(
         "MICRO_PROFIT_PROTECTION_ENABLED", False
     )
-    early_profit_lock_enabled: bool = _bool("EARLY_PROFIT_LOCK_ENABLED", True)
-    early_profit_lock_trigger_usd: float = max(
-        0.01, float(os.getenv("EARLY_PROFIT_LOCK_TRIGGER_USD", "0.12"))
-    )
-    early_profit_lock_floor_usd: float = min(
-        max(0.0, early_profit_lock_trigger_usd - 0.01),
-        max(0.0, float(os.getenv("EARLY_PROFIT_LOCK_FLOOR_USD", "0.03"))),
-    )
+    # Tiered broker-side profit protection. Every pre-trailing tier uses the
+    # live, cost-adjusted profit rather than a historical peak, preventing the
+    # retired unconditional small-dollar lock from arming on a retracement.
     profit_lock_enabled: bool = _bool("PROFIT_LOCK_ENABLED", True)
     profit_lock_trigger_r: float = max(
-        0.1, float(os.getenv("PROFIT_LOCK_TRIGGER_R", "0.75"))
-    )
-    profit_lock_min_live_fraction: float = min(
-        1.0,
-        max(0.1, float(os.getenv("PROFIT_LOCK_MIN_LIVE_FRACTION", "0.75"))),
-    )
-    profit_lock_floor_usd: float = max(
-        0.0, float(os.getenv("PROFIT_LOCK_FLOOR_USD", "0.03"))
+        0.1, float(os.getenv("PROFIT_LOCK_TRIGGER_R", "0.50"))
     )
     profit_lock_trigger_usd: float = max(
-        0.0, float(os.getenv("PROFIT_LOCK_TRIGGER_USD", "0.20"))
+        0.01, float(os.getenv("PROFIT_LOCK_TRIGGER_USD", "0.35"))
+    )
+    profit_lock_floor_usd: float = max(
+        0.0, float(os.getenv("PROFIT_LOCK_FLOOR_USD", "0.08"))
+    )
+    profit_lock_mid_trigger_r: float = max(
+        profit_lock_trigger_r,
+        float(os.getenv("PROFIT_LOCK_MID_TRIGGER_R", "0.75")),
+    )
+    profit_lock_mid_trigger_usd: float = max(
+        profit_lock_trigger_usd,
+        float(os.getenv("PROFIT_LOCK_MID_TRIGGER_USD", "0.60")),
+    )
+    profit_lock_mid_fraction: float = min(
+        0.95,
+        max(0.05, float(os.getenv("PROFIT_LOCK_MID_FRACTION", "0.35"))),
+    )
+    profit_lock_final_trigger_usd: float = max(
+        profit_lock_mid_trigger_usd,
+        float(os.getenv("PROFIT_LOCK_FINAL_TRIGGER_USD", "1.15")),
+    )
+    profit_lock_final_floor_usd: float = max(
+        profit_lock_floor_usd,
+        float(os.getenv("PROFIT_LOCK_FINAL_FLOOR_USD", "1.00")),
     )
     profit_giveback_enabled: bool = _bool("PROFIT_GIVEBACK_ENABLED", True)
     profit_giveback_trigger_r: float = max(
         0.1, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_R", "0.50"))
+    )
+    # A broker-side floor may be armed before a winner is mature enough for a
+    # full market giveback exit.  Keeping these thresholds separate prevents a
+    # normal sub-1R pullback from prematurely ending an otherwise protected
+    # trade.  Positions without a reconstructed R baseline retain the bounded
+    # dollar fallback below.
+    profit_giveback_close_min_r: float = max(
+        0.1, float(os.getenv("PROFIT_GIVEBACK_CLOSE_MIN_R", "1.00"))
     )
     profit_giveback_trigger_usd: float = max(
         0.0, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_USD", "0.20"))
@@ -470,10 +630,10 @@ class AppConfig:
     profit_peak_persist_delta_usd: float = max(
         0.01, float(os.getenv("PROFIT_PEAK_PERSIST_DELTA_USD", "0.01"))
     )
-    breakeven_trigger_r: float = float(os.getenv("BREAKEVEN_TRIGGER_R", "1.0"))
+    breakeven_trigger_r: float = float(os.getenv("BREAKEVEN_TRIGGER_R", "0.75"))
     breakeven_buffer_pips: float = float(os.getenv("BREAKEVEN_BUFFER_PIPS", "0.2"))
-    trailing_trigger_r: float = float(os.getenv("TRAILING_TRIGGER_R", "1.5"))
-    trailing_distance_r: float = float(os.getenv("TRAILING_DISTANCE_R", "0.75"))
+    trailing_trigger_r: float = float(os.getenv("TRAILING_TRIGGER_R", "1.0"))
+    trailing_distance_r: float = float(os.getenv("TRAILING_DISTANCE_R", "0.60"))
     position_stagnation_exit_enabled: bool = _bool(
         "POSITION_STAGNATION_EXIT_ENABLED", True
     )

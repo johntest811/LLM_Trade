@@ -10,6 +10,7 @@ from app_config.settings import settings
 from core.evidence import (
     has_directional_m5_trigger,
     has_directional_trigger,
+    permitted_entry_actions,
     resolve_evidence_aliases,
     unknown_evidence_ids,
 )
@@ -26,6 +27,7 @@ class DecisionValidator:
         allowed_evidence_ids: Optional[Iterable[str]] = None,
         close_position_side: Optional[str] = None,
         close_trigger_timeframes: Iterable[str] = ("M5",),
+        permitted_actions: Optional[Iterable[str]] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         if not raw_output:
             return False, None, "Empty LLM output response."
@@ -102,6 +104,26 @@ class DecisionValidator:
                     f"{action} requires a supplied directional M5 BOS, CHoCH, "
                     "breakout, pullback-retest, or validated range evidence ID.",
                 )
+            if action in {"BUY", "SELL"}:
+                bounded_actions = tuple(
+                    dict.fromkeys(
+                        str(value).upper()
+                        for value in (
+                            permitted_actions
+                            if permitted_actions is not None
+                            else permitted_entry_actions(allowed_evidence_ids)
+                        )
+                        if str(value).upper() in {"BUY", "SELL"}
+                    )
+                )
+                if action not in bounded_actions:
+                    label = ", ".join(bounded_actions) or "HOLD only"
+                    return (
+                        False,
+                        parsed,
+                        f"{action} is outside the deterministic entry contract; "
+                        f"permitted action(s): {label}.",
+                    )
             if action == "CLOSE" and close_position_side:
                 opposing_action = {
                     "BUY": "SELL",

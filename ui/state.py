@@ -5,7 +5,6 @@ Thread-safe singleton store for all live dashboard state.
 The trading engine writes updates here; the WebSocket broadcaster
 reads from here every second and pushes JSON to connected browsers.
 """
-import asyncio
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timezone
@@ -126,6 +125,9 @@ class ShadowMetrics:
     ambiguous: int = 0
     win_rate_pct: float = 0.0
     expectancy_r: float = 0.0
+    gate_breakdown: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_window_hours: int = 48
+    direction_breakdown: List[Dict[str, Any]] = field(default_factory=list)
     updated_at: str = ""
 
 
@@ -580,7 +582,53 @@ class DashboardState:
             if len(self.tick_stream) > 50:
                 self.tick_stream = self.tick_stream[-50:]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def symbol_decisions_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return decisions without serializing the entire dashboard state."""
+        with self._lock:
+            return {
+                key: asdict(value)
+                for key, value in self.symbol_decisions.items()
+            }
+
+    @staticmethod
+    def _compact_market_fit(value: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep only market-fit fields consumed by the browser dashboard."""
+        keys = (
+            "status",
+            "capital_fit",
+            "reason",
+            "risk_budget_usd",
+            "min_stop_risk_usd",
+            "min_volume",
+            "min_margin_usd",
+            "projected_margin_pct",
+            "spread_value",
+            "spread_unit",
+            "broker_open",
+            "asset_class",
+            "selection_score",
+            "selection_regime",
+            "selection_adx",
+            "selection_rank",
+            "selected",
+            "model_selected",
+            "model_selection_rank",
+        )
+        compact = {key: value.get(key) for key in keys if key in value}
+        directions = value.get("directions", {}) or {}
+        compact["directions"] = {
+            side: {"capital_fit": bool((details or {}).get("capital_fit"))}
+            for side, details in directions.items()
+            if side in {"BUY", "SELL"}
+        }
+        return compact
+
+    def to_dict(
+        self,
+        *,
+        compact: bool = False,
+        include_tick_stream: bool = True,
+    ) -> Dict[str, Any]:
         with self._lock:
             self._payload_sequence += 1
             return {
@@ -597,9 +645,16 @@ class DashboardState:
                 "closed_trades": [asdict(t) for t in self.closed_trades[:20]],
                 "prices": {k: asdict(v) for k, v in self.prices.items()},
                 "symbol_decisions": {k: asdict(v) for k, v in self.symbol_decisions.items()},
-                "market_fits": dict(self.market_fits),
+                "market_fits": (
+                    {
+                        key: self._compact_market_fit(value)
+                        for key, value in self.market_fits.items()
+                    }
+                    if compact
+                    else dict(self.market_fits)
+                ),
                 "logs": self.logs[-50:],
-                "tick_stream": self.tick_stream,
+                "tick_stream": self.tick_stream if include_tick_stream else [],
             }
 
 

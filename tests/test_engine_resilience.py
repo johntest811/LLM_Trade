@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import MetaTrader5 as mt5
 
@@ -36,6 +36,154 @@ class _Connection:
 
 
 class EngineResilienceTests(unittest.TestCase):
+    @staticmethod
+    def _fast_path_analysis(direction="BULLISH", *, trigger=False):
+        bullish = direction == "BULLISH"
+        structure = {
+            "trend": direction,
+            "trend_state_direction": direction,
+            "trend_state": f"CONFIRMED_{direction}",
+            "structure_events": [],
+            "breakout_status": "NONE",
+        }
+        if trigger:
+            structure["structure_events"] = [
+                {
+                    "type": "BOS",
+                    "direction": direction,
+                    "time": "2026-08-12T00:05:00+00:00",
+                }
+            ]
+        return {
+            "timestamp": "2026-08-12T00:05:00+00:00",
+            "indicators": {
+                "adx_14": 30.0,
+                "ema_9": 1.2 if bullish else 1.0,
+                "ema_21": 1.1,
+                "rsi_14": 58.0 if bullish else 42.0,
+                "macd": {"diff": 0.01 if bullish else -0.01},
+                "candle_range_atr": 0.8,
+                "opening_gap_atr": 0.0,
+            },
+            "market_structure": structure,
+        }
+
+    def _fast_path_context(self, direction="BULLISH"):
+        return {
+            "symbol": "USDJPY",
+            "completed_bar": "2026-08-12 00:05:00",
+            "has_open_position": False,
+            "open_positions": [],
+            "previous_trend_states": {},
+            "market": {},
+            "analyses": {
+                timeframe: self._fast_path_analysis(
+                    direction,
+                    trigger=timeframe == "M5",
+                )
+                for timeframe in ("M5", "M15", "H1", "H4")
+            },
+        }
+
+    def test_deterministic_entry_fast_path_accepts_one_fully_aligned_direction(self):
+        context = self._fast_path_context()
+        enabled = replace(settings, deterministic_entry_fast_path_enabled=True)
+
+        with (
+            patch("core.engine.settings", enabled),
+            patch("llm.client.settings", enabled),
+        ):
+            decision = TradingEngine._deterministic_entry_fast_path(
+                context,
+                ("BUY",),
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["action"], "BUY")
+        self.assertEqual(decision["_decision_path"], "DETERMINISTIC_FAST_PATH")
+        self.assertGreaterEqual(decision["confidence"], enabled.confidence_threshold)
+
+    def test_deterministic_entry_fast_path_rejects_macro_disagreement(self):
+        context = self._fast_path_context()
+        context["analyses"]["H4"] = self._fast_path_analysis("BEARISH")
+        enabled = replace(settings, deterministic_entry_fast_path_enabled=True)
+
+        with (
+            patch("core.engine.settings", enabled),
+            patch("llm.client.settings", enabled),
+        ):
+            decision = TradingEngine._deterministic_entry_fast_path(
+                context,
+                ("BUY",),
+            )
+
+        self.assertIsNone(decision)
+
+    def test_deterministic_entry_fast_path_requires_unique_fresh_m5_direction(self):
+        context = self._fast_path_context()
+        enabled = replace(settings, deterministic_entry_fast_path_enabled=True)
+
+        with (
+            patch("core.engine.settings", enabled),
+            patch("llm.client.settings", enabled),
+        ):
+            ambiguous = TradingEngine._deterministic_entry_fast_path(
+                context,
+                ("BUY", "SELL"),
+            )
+            context["analyses"]["M5"] = self._fast_path_analysis("BULLISH")
+            missing_trigger = TradingEngine._deterministic_entry_fast_path(
+                context,
+                ("BUY",),
+            )
+
+        self.assertIsNone(ambiguous)
+        self.assertIsNone(missing_trigger)
+
+    def test_deterministic_entry_fast_path_can_be_disabled(self):
+        context = self._fast_path_context()
+        disabled = replace(settings, deterministic_entry_fast_path_enabled=False)
+
+        with patch("core.engine.settings", disabled):
+            decision = TradingEngine._deterministic_entry_fast_path(
+                context,
+                ("BUY",),
+            )
+
+        self.assertIsNone(decision)
+
+    def test_entry_model_admission_is_idempotent_and_bounded_per_bar(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine._entry_model_admissions = {}
+        bounded_settings = replace(settings, llm_entry_candidates_per_bar=2)
+
+        with patch("core.engine.settings", bounded_settings):
+            first = engine._reserve_entry_model_slot("USDJPY", "2026-08-12 00:00")
+            repeated = engine._reserve_entry_model_slot("USDJPY", "2026-08-12 00:00")
+            second = engine._reserve_entry_model_slot("EURUSD", "2026-08-12 00:00")
+            rejected = engine._reserve_entry_model_slot("GBPUSD", "2026-08-12 00:00")
+            next_bar = engine._reserve_entry_model_slot("GBPUSD", "2026-08-12 00:05")
+
+        self.assertTrue(first[0])
+        self.assertTrue(repeated[0])
+        self.assertTrue(second[0])
+        self.assertFalse(rejected[0])
+        self.assertIn("already admitted 2 candidates", rejected[1])
+        self.assertTrue(next_bar[0])
+
+    def test_entry_model_admission_prunes_old_completed_bars(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine._entry_model_admissions = {}
+
+        for index in range(10):
+            admitted, _ = engine._reserve_entry_model_slot(
+                "USDJPY", f"2026-08-12 00:{index:02d}"
+            )
+            self.assertTrue(admitted)
+
+        self.assertLessEqual(len(engine._entry_model_admissions), 8)
+        self.assertNotIn("2026-08-12 00:00", engine._entry_model_admissions)
+
     def test_initial_risk_calculation_does_not_block_event_loop(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.db = SimpleNamespace(
@@ -204,7 +352,7 @@ class EngineResilienceTests(unittest.TestCase):
             apply_trailing_stop=AsyncMock(),
         )
         engine._active_account_identity = {"login": 1001}
-        engine._peak_profits = {88: 12.0}
+        engine._peak_profits = {88: 10.0}
         engine._peak_profit_usd = {88: 0.20}
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
@@ -228,9 +376,9 @@ class EngineResilienceTests(unittest.TestCase):
         }
         protection_settings = replace(
             settings,
-            early_profit_lock_enabled=False,
             profit_giveback_enabled=True,
-            profit_giveback_trigger_r=1.0,
+            profit_giveback_trigger_r=0.50,
+            profit_giveback_close_min_r=1.00,
             profit_giveback_fraction=0.50,
             profit_lock_floor_usd=0.03,
         )
@@ -241,7 +389,7 @@ class EngineResilienceTests(unittest.TestCase):
             88, expected_account=engine._active_account_identity
         )
 
-    def test_mid_r_profit_lock_scales_floor_from_cost_adjusted_peak(self):
+    def test_mid_profit_lock_protects_35_percent_of_live_net_profit(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(),
@@ -265,7 +413,7 @@ class EngineResilienceTests(unittest.TestCase):
             "symbol": "AUDUSD",
             "profit": 0.84,
             "estimated_net_profit_usd": 0.80,
-            "profit_pips": 7.0,
+            "profit_pips": 8.0,
             "peak_profit_usd": 0.88,
             "initial_risk_pips": 10.0,
             "volume": 0.02,
@@ -276,11 +424,13 @@ class EngineResilienceTests(unittest.TestCase):
         protection_settings = replace(
             settings,
             micro_profit_protection_enabled=False,
-            early_profit_lock_enabled=False,
             profit_lock_enabled=True,
             profit_lock_trigger_r=0.50,
-            profit_lock_min_live_fraction=0.75,
-            profit_lock_floor_usd=0.03,
+            profit_lock_trigger_usd=0.35,
+            profit_lock_floor_usd=0.08,
+            profit_lock_mid_trigger_r=0.75,
+            profit_lock_mid_trigger_usd=0.60,
+            profit_lock_mid_fraction=0.35,
             profit_giveback_enabled=True,
             profit_giveback_trigger_r=0.50,
             profit_giveback_fraction=0.50,
@@ -294,11 +444,149 @@ class EngineResilienceTests(unittest.TestCase):
         engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_awaited_once_with(
             188,
-            floor_usd=0.42,
+            floor_usd=0.28,
             expected_account=engine._active_account_identity,
         )
 
-    def test_mid_r_giveback_closes_after_half_of_peak_is_lost(self):
+    def test_profit_lock_tiers_require_both_live_usd_and_r(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_trigger_r=0.50,
+            profit_lock_trigger_usd=0.35,
+            profit_lock_floor_usd=0.08,
+            profit_lock_mid_trigger_r=0.75,
+            profit_lock_mid_trigger_usd=0.60,
+            profit_lock_mid_fraction=0.35,
+            profit_lock_final_trigger_usd=1.15,
+            profit_lock_final_floor_usd=1.00,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.50,
+                    estimated_net_profit_usd=0.34,
+                    has_r_baseline=True,
+                ),
+                (0.0, ""),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.49,
+                    estimated_net_profit_usd=0.35,
+                    has_r_baseline=True,
+                ),
+                (0.0, ""),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.50,
+                    estimated_net_profit_usd=0.35,
+                    has_r_baseline=True,
+                ),
+                (0.08, "first"),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.75,
+                    estimated_net_profit_usd=0.60,
+                    has_r_baseline=True,
+                ),
+                (0.21, "35%"),
+            )
+
+    def test_final_profit_lock_is_one_dollar_without_r_baseline(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_final_trigger_usd=1.15,
+            profit_lock_final_floor_usd=1.00,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.0,
+                    estimated_net_profit_usd=1.15,
+                    has_r_baseline=False,
+                ),
+                (1.00, "final"),
+            )
+
+    def test_profit_lock_can_upgrade_from_first_to_final_tier(self):
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.executor = SimpleNamespace(
+            close_position=AsyncMock(),
+            lock_minimum_net_profit=AsyncMock(
+                return_value=ExecutionResult(True, 190, 1.10008, 0.01, None)
+            ),
+            move_to_breakeven=AsyncMock(),
+            apply_trailing_stop=AsyncMock(),
+        )
+        engine._active_account_identity = {"login": 1001}
+        engine._peak_profits = {190: 5.0}
+        engine._peak_profit_usd = {190: 0.35}
+        engine._profit_lock_tickets = set()
+        engine.replay_logger = SimpleNamespace(update_replay_outcome=MagicMock())
+        engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))
+        engine.log = MagicMock()
+        position = {
+            "ticket": 190,
+            "symbol": "EURUSD",
+            "profit": 0.35,
+            "estimated_net_profit_usd": 0.35,
+            "profit_pips": 5.0,
+            "peak_profit_usd": 0.35,
+            "initial_risk_pips": 10.0,
+            "duration_min": 10.0,
+            "volume": 0.01,
+            "price_current": 1.1005,
+            "sl": 1.0990,
+            "tp": 1.1020,
+        }
+        protection_settings = replace(
+            settings,
+            auto_close_profit_enabled=False,
+            auto_close_loss_enabled=False,
+            profit_giveback_enabled=False,
+            profit_lock_enabled=True,
+            profit_lock_trigger_r=0.50,
+            profit_lock_trigger_usd=0.35,
+            profit_lock_floor_usd=0.08,
+            profit_lock_mid_trigger_r=0.75,
+            profit_lock_mid_trigger_usd=0.60,
+            profit_lock_mid_fraction=0.35,
+            profit_lock_final_trigger_usd=1.15,
+            profit_lock_final_floor_usd=1.00,
+            position_stagnation_exit_enabled=False,
+            breakeven_trigger_r=10.0,
+            trailing_trigger_r=10.0,
+        )
+
+        with patch("core.engine.settings", protection_settings):
+            asyncio.run(engine._apply_protections([position]))
+            position.update(
+                profit=1.15,
+                estimated_net_profit_usd=1.15,
+                profit_pips=11.5,
+                peak_profit_usd=1.15,
+            )
+            asyncio.run(engine._apply_protections([position]))
+
+        engine.executor.lock_minimum_net_profit.assert_has_awaits(
+            [
+                call(
+                    190,
+                    floor_usd=0.08,
+                    expected_account=engine._active_account_identity,
+                ),
+                call(
+                    190,
+                    floor_usd=1.00,
+                    expected_account=engine._active_account_identity,
+                ),
+            ]
+        )
+        self.assertEqual(engine._profit_lock_levels[190], 1.00)
+
+    def test_mid_r_giveback_keeps_protected_trade_open_below_one_r(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(
@@ -333,11 +621,11 @@ class EngineResilienceTests(unittest.TestCase):
         protection_settings = replace(
             settings,
             micro_profit_protection_enabled=False,
-            early_profit_lock_enabled=False,
             profit_lock_enabled=True,
             profit_lock_trigger_r=0.50,
             profit_giveback_enabled=True,
             profit_giveback_trigger_r=0.50,
+            profit_giveback_close_min_r=1.00,
             profit_giveback_fraction=0.50,
             breakeven_trigger_r=10.0,
             trailing_trigger_r=10.0,
@@ -346,9 +634,7 @@ class EngineResilienceTests(unittest.TestCase):
         with patch("core.engine.settings", protection_settings):
             asyncio.run(engine._apply_protections([position]))
 
-        engine.executor.close_position.assert_awaited_once_with(
-            189, expected_account=engine._active_account_identity
-        )
+        engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_not_awaited()
 
     def test_fixed_dollar_giveback_works_without_risk_baseline(self):
@@ -386,7 +672,6 @@ class EngineResilienceTests(unittest.TestCase):
         protection_settings = replace(
             settings,
             micro_profit_protection_enabled=True,
-            early_profit_lock_enabled=False,
             profit_giveback_enabled=True,
             profit_giveback_trigger_r=1.0,
             profit_giveback_trigger_usd=0.20,
@@ -411,7 +696,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {}
         engine._peak_profit_usd = {}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine._initial_risk_for_position = AsyncMock(
             return_value=(10.0, True)
@@ -452,7 +736,6 @@ class EngineResilienceTests(unittest.TestCase):
             auto_close_loss_enabled=True,
             auto_close_loss_usd=0.50,
             micro_profit_protection_enabled=False,
-            early_profit_lock_enabled=False,
             profit_giveback_enabled=False,
             profit_lock_enabled=False,
             breakeven_trigger_r=10.0,
@@ -520,7 +803,7 @@ class EngineResilienceTests(unittest.TestCase):
 
         positions_get.assert_not_called()
 
-    def test_micro_profit_guard_locks_ten_cents_at_twenty_cent_peak(self):
+    def test_first_profit_tier_locks_eight_cents_at_threshold(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(),
@@ -531,8 +814,8 @@ class EngineResilienceTests(unittest.TestCase):
             apply_trailing_stop=AsyncMock(),
         )
         engine._active_account_identity = {"login": 1001}
-        engine._peak_profits = {90: 2.0}
-        engine._peak_profit_usd = {90: 0.20}
+        engine._peak_profits = {90: 5.0}
+        engine._peak_profit_usd = {90: 0.35}
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
             update_replay_outcome=MagicMock()
@@ -542,10 +825,10 @@ class EngineResilienceTests(unittest.TestCase):
         position = {
             "ticket": 90,
             "symbol": "EURUSD",
-            "profit": 0.20,
-            "estimated_net_profit_usd": 0.20,
-            "profit_pips": 2.0,
-            "peak_profit_usd": 0.20,
+            "profit": 0.35,
+            "estimated_net_profit_usd": 0.35,
+            "profit_pips": 5.0,
+            "peak_profit_usd": 0.35,
             "initial_risk_pips": 10.0,
             "volume": 0.01,
             "price_current": 1.1002,
@@ -554,16 +837,12 @@ class EngineResilienceTests(unittest.TestCase):
         }
         protection_settings = replace(
             settings,
-            micro_profit_protection_enabled=True,
-            early_profit_lock_enabled=False,
-            profit_giveback_enabled=True,
-            profit_giveback_trigger_r=10.0,
-            profit_giveback_trigger_usd=0.20,
-            profit_giveback_fraction=0.25,
+            micro_profit_protection_enabled=False,
+            profit_giveback_enabled=False,
             profit_lock_enabled=True,
-            profit_lock_trigger_r=10.0,
-            profit_lock_trigger_usd=0.20,
-            profit_lock_floor_usd=0.10,
+            profit_lock_trigger_r=0.50,
+            profit_lock_trigger_usd=0.35,
+            profit_lock_floor_usd=0.08,
             breakeven_trigger_r=10.0,
             trailing_trigger_r=10.0,
         )
@@ -574,7 +853,7 @@ class EngineResilienceTests(unittest.TestCase):
         engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_awaited_once_with(
             90,
-            floor_usd=0.10,
+            floor_usd=0.08,
             expected_account=engine._active_account_identity,
         )
 
@@ -589,7 +868,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {94: 2.2}
         engine._peak_profit_usd = {94: 0.20}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
             update_replay_outcome=MagicMock()
@@ -614,7 +892,6 @@ class EngineResilienceTests(unittest.TestCase):
             micro_profit_protection_enabled=False,
             auto_close_profit_enabled=False,
             auto_close_loss_enabled=False,
-            early_profit_lock_enabled=False,
             profit_lock_enabled=True,
             profit_lock_trigger_r=10.0,
             profit_lock_trigger_usd=0.20,
@@ -635,7 +912,7 @@ class EngineResilienceTests(unittest.TestCase):
         engine.executor.move_to_breakeven.assert_not_awaited()
         engine.executor.apply_trailing_stop.assert_not_awaited()
 
-    def test_micro_profit_guard_closes_after_twenty_five_percent_giveback(self):
+    def test_micro_profit_guard_does_not_override_sub_one_r_maturity_gate(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(
@@ -670,9 +947,9 @@ class EngineResilienceTests(unittest.TestCase):
         protection_settings = replace(
             settings,
             micro_profit_protection_enabled=True,
-            early_profit_lock_enabled=False,
             profit_giveback_enabled=True,
             profit_giveback_trigger_r=10.0,
+            profit_giveback_close_min_r=1.00,
             profit_giveback_trigger_usd=0.20,
             profit_giveback_fraction=0.25,
             profit_lock_enabled=True,
@@ -686,12 +963,10 @@ class EngineResilienceTests(unittest.TestCase):
         with patch("core.engine.settings", protection_settings):
             asyncio.run(engine._apply_protections([position]))
 
-        engine.executor.close_position.assert_awaited_once_with(
-            91, expected_account=engine._active_account_identity
-        )
+        engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_not_awaited()
 
-    def test_early_profit_lock_preserves_headroom_at_twelve_cent_peak(self):
+    def test_retired_small_dollar_lock_does_not_arm_at_twelve_cents(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(),
@@ -704,7 +979,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {92: 1.2}
         engine._peak_profit_usd = {92: 0.12}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
             update_replay_outcome=MagicMock()
@@ -729,10 +1003,7 @@ class EngineResilienceTests(unittest.TestCase):
             micro_profit_protection_enabled=True,
             auto_close_profit_enabled=False,
             auto_close_loss_enabled=False,
-            early_profit_lock_enabled=True,
-            early_profit_lock_trigger_usd=0.12,
-            early_profit_lock_floor_usd=0.03,
-            profit_lock_enabled=False,
+            profit_lock_enabled=True,
             profit_giveback_enabled=False,
             breakeven_trigger_r=10.0,
             trailing_trigger_r=10.0,
@@ -742,13 +1013,9 @@ class EngineResilienceTests(unittest.TestCase):
             asyncio.run(engine._apply_protections([position]))
 
         engine.executor.close_position.assert_not_awaited()
-        engine.executor.lock_minimum_net_profit.assert_awaited_once_with(
-            92,
-            floor_usd=0.03,
-            expected_account=engine._active_account_identity,
-        )
+        engine.executor.lock_minimum_net_profit.assert_not_awaited()
 
-    def test_early_profit_lock_fallback_closes_before_gain_turns_negative(self):
+    def test_retired_small_dollar_fallback_does_not_market_close(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(
@@ -761,7 +1028,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {93: 1.2}
         engine._peak_profit_usd = {93: 0.12}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
             update_replay_outcome=MagicMock()
@@ -786,9 +1052,6 @@ class EngineResilienceTests(unittest.TestCase):
             micro_profit_protection_enabled=True,
             auto_close_profit_enabled=False,
             auto_close_loss_enabled=False,
-            early_profit_lock_enabled=True,
-            early_profit_lock_trigger_usd=0.12,
-            early_profit_lock_floor_usd=0.03,
             profit_lock_enabled=False,
             profit_giveback_enabled=False,
             breakeven_trigger_r=10.0,
@@ -798,12 +1061,10 @@ class EngineResilienceTests(unittest.TestCase):
         with patch("core.engine.settings", protection_settings):
             asyncio.run(engine._apply_protections([position]))
 
-        engine.executor.close_position.assert_awaited_once_with(
-            93, expected_account=engine._active_account_identity
-        )
+        engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_not_awaited()
 
-    def test_early_profit_lock_fallback_uses_net_profit_after_costs(self):
+    def test_retired_small_dollar_fallback_ignores_cost_adjusted_retrace(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(
@@ -816,7 +1077,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {94: 1.5}
         engine._peak_profit_usd = {94: 0.15}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(
             update_replay_outcome=MagicMock()
@@ -841,9 +1101,6 @@ class EngineResilienceTests(unittest.TestCase):
             micro_profit_protection_enabled=True,
             auto_close_profit_enabled=False,
             auto_close_loss_enabled=False,
-            early_profit_lock_enabled=True,
-            early_profit_lock_trigger_usd=0.12,
-            early_profit_lock_floor_usd=0.03,
             profit_lock_enabled=False,
             profit_giveback_enabled=False,
             breakeven_trigger_r=10.0,
@@ -853,9 +1110,7 @@ class EngineResilienceTests(unittest.TestCase):
         with patch("core.engine.settings", protection_settings):
             asyncio.run(engine._apply_protections([position]))
 
-        engine.executor.close_position.assert_awaited_once_with(
-            94, expected_account=engine._active_account_identity
-        )
+        engine.executor.close_position.assert_not_awaited()
         engine.executor.lock_minimum_net_profit.assert_not_awaited()
 
     def test_r_profit_lock_waits_for_current_price_to_retain_peak_progress(self):
@@ -869,7 +1124,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {195: 6.0}
         engine._peak_profit_usd = {195: 0.30}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(update_replay_outcome=MagicMock())
         engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))
@@ -896,7 +1150,6 @@ class EngineResilienceTests(unittest.TestCase):
             profit_giveback_enabled=False,
             profit_lock_enabled=True,
             profit_lock_trigger_r=0.50,
-            profit_lock_min_live_fraction=0.75,
             position_stagnation_exit_enabled=False,
             breakeven_trigger_r=10.0,
             trailing_trigger_r=10.0,
@@ -926,7 +1179,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {197: 8.0}
         engine._peak_profit_usd = {197: 0.80}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = {197}
         engine._breakeven_tickets = set()
         engine.replay_logger = SimpleNamespace(update_replay_outcome=MagicMock())
@@ -982,7 +1234,6 @@ class EngineResilienceTests(unittest.TestCase):
         engine._active_account_identity = {"login": 1001}
         engine._peak_profits = {196: 1.0}
         engine._peak_profit_usd = {196: 0.05}
-        engine._early_profit_lock_tickets = set()
         engine._profit_lock_tickets = set()
         engine.replay_logger = SimpleNamespace(update_replay_outcome=MagicMock())
         engine.db = SimpleNamespace(log_trade=AsyncMock(return_value=True))

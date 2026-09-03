@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#070b12">
   <title>LLM Trading Terminal</title>
-  <link rel="stylesheet" href="/static/terminal.css?v=20260720-1">
-  <script src="/static/terminal.js?v=20260804-1" defer></script>
+  <link rel="stylesheet" href="/static/terminal.css?v=20260812-1">
+  <script src="/static/terminal.js?v=20260812-1" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to trading workspace</a>
@@ -17,7 +17,7 @@
         <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div>
           <div class="brand-name">LLM Trading Terminal</div>
-          <div class="brand-tagline">Deterministic decisions · optional model assistance</div>
+          <div class="brand-tagline">Evidence-led entries · bounded model confirmation</div>
         </div>
       </div>
 
@@ -47,6 +47,13 @@
       <strong>LIVE ACCOUNT</strong>
       <span>Orders can use real funds. Autonomous authorization, when enabled, remains bound to this exact MT5 account.</span>
     </div>
+
+    <section class="runtime-ribbon" aria-label="Decision runtime">
+      <div><span>Data</span><strong id="runtime-freshness">Connecting</strong></div>
+      <div><span>Scan</span><strong>M5 close</strong></div>
+      <div><span>Model lane</span><strong id="runtime-lane">Bounded queue</strong></div>
+      <div><span>Authority</span><strong>Confirm / veto</strong></div>
+    </section>
 
     <main id="main-content" tabindex="-1">
       <section id="risk-banner" class="alert-banner" role="alert" hidden>
@@ -202,9 +209,13 @@
                 <i id="confidence-bar"></i><b id="confidence-threshold-marker" style="left:70%"><span>Gate 70%</span></b>
               </div>
               <p class="confidence-disclaimer">Decision confidence is an evidence gate, not an estimated win probability.</p>
+              <div class="decision-path" aria-label="Autonomous decision path">
+                <span>Evidence</span><i>→</i><span>Model confirm</span><i>→</i><span>Risk</span><i>→</i><span>Broker</span>
+              </div>
               <dl class="detail-list">
                 <div><dt>Decision time</dt><dd id="decision-latency">—</dd></div>
                 <div><dt>Provider</dt><dd id="decision-model">—</dd></div>
+                <div><dt>Model role</dt><dd id="decision-role">Confirm / veto only</dd></div>
                 <div><dt>Scan trigger</dt><dd id="scan-timeframe">M5 close</dd></div>
                 <div><dt>Confirmation</dt><dd id="scan-confirmation">M15 / H1 / H4</dd></div>
                 <div><dt>Scan status</dt><dd id="scan-status">NOT STARTED</dd></div>
@@ -220,6 +231,8 @@
               <span id="market-fit-count" class="panel-count">ASSESSING</span>
             </header>
             <p id="shadow-summary" class="context-note">Rejected-signal evidence is initializing.</p>
+            <p id="shadow-gates" class="context-note">Recent gate outcomes are initializing.</p>
+            <p id="shadow-directions" class="context-note">BUY/SELL execution balance is initializing.</p>
             <div id="capital-fit-grid" class="capital-fit-grid"><div class="empty-card">Capital diagnostics appear after M5 analysis.</div></div>
           </section>
 
@@ -293,26 +306,27 @@
       <header class="modal-header"><div><p class="eyebrow">Configuration</p><h2 id="settings-title">Terminal settings</h2></div><button class="button icon-button modal-close" type="button" data-close-dialog="settings-dialog" aria-label="Close settings">×</button></header>
       <div class="modal-body settings-body">
         <section class="settings-section" id="local-model-profile">
-          <h3>Local Qwen profile</h3>
+          <h3>Local model profile</h3>
           <div class="form-grid two">
             <div class="field">
               <label for="c-quantization">Quantization profile</label>
               <select id="c-quantization">
-                <option value="AUTO">Follow LM Studio · Q6_K / Q8_0</option>
-                <option value="Q6_K">Q6_K · recommended · faster</option>
+                <option value="AUTO">Follow LM Studio · Q4_K_M / Q6_K / Q8_0</option>
+                <option value="Q4_K_M">Q4_K_M · 4GB laptop · recommended</option>
+                <option value="Q6_K">Q6_K · desktop quality / speed</option>
                 <option value="Q8_0">Q8_0 · larger · slower</option>
               </select>
               <small id="c-quantization-hint">Follow mode accepts either supported loaded variant automatically.</small>
             </div>
             <div class="field">
               <label>Concurrency profile</label>
-              <div class="readonly-value" id="c-concurrency-profile">2 predictions · Q6_K</div>
-              <small>Follow mode and Q8_0 use one project prediction to remain compatible during a live switch.</small>
+              <div class="readonly-value" id="c-concurrency-profile">1 prediction · bounded latency</div>
+              <small>One prediction avoids GPU-memory contention and keeps model work inside the entry window.</small>
             </div>
           </div>
-          <p class="section-help">Follow mode lets LM Studio switch between the installed Q6_K and Q8_0 variants without another project configuration change. Pin a profile only when you want strict enforcement. Unsupported quantizations remain fail-closed.</p>
+          <p class="section-help">Follow mode accepts the supported loaded variant. Q4_K_M is the practical profile for the MSI laptop's 4GB GPU; Q6_K and Q8_0 are desktop-oriented. Pin a profile only for strict enforcement.</p>
         </section>
-        <section class="settings-section"><h3>Markets & decision service</h3><div class="field"><label for="c-symbols">Core weekday symbols</label><input id="c-symbols" autocomplete="off" required><small>Always included in the bounded Pepperstone candidate universe.</small></div><div class="field"><label for="c-candidates">Adaptive market candidates</label><input id="c-candidates" autocomplete="off" required><small>Broker availability, capital fit, spread, ADX, risk and margin determine the active selection.</small></div><div class="form-grid two"><div class="field"><label for="c-dynamic-markets">Adaptive selection</label><select id="c-dynamic-markets"><option value="true">Enabled · recommended</option><option value="false">Disabled · core symbols only</option></select></div><div class="field"><label for="c-market-max">Maximum active markets</label><input id="c-market-max" type="number" min="1" max="12" required></div><div class="field"><label for="c-market-refresh">Market ranking refresh</label><div class="input-unit"><input id="c-market-refresh" type="number" min="30" max="3600" required><span>seconds</span></div></div><div class="field"><label for="c-analysis">Candle polling interval</label><div class="input-unit"><input id="c-analysis" type="number" min="15" max="300" required><span>seconds</span></div></div><div class="field"><label for="c-provider">Decision provider</label><select id="c-provider"><option value="deterministic">Deterministic · no LLM</option><option value="local">Local · LM Studio</option><option value="openai">OpenAI · Responses API</option></select></div><div class="field"><label for="c-model">Decision model</label><input id="c-model" autocomplete="off" required><small id="c-provider-hint">Deterministic rules use completed-candle evidence with no API or model delay.</small></div><div class="field"><label for="c-reasoning">OpenAI reasoning</label><select id="c-reasoning"><option value="none">None · fastest</option><option value="low">Low · recommended for M5</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option></select></div></div><div class="field"><label for="c-timeframe">Decision trigger</label><select id="c-timeframe" disabled><option>M5 close · adaptive continuation / pullback / reversal · M15 / H1 / H4 confirmation</option></select></div></section>
+        <section class="settings-section"><h3>Markets & decision service</h3><div class="field"><label for="c-symbols">Core weekday symbols</label><input id="c-symbols" autocomplete="off" required><small>Always included in the bounded Pepperstone candidate universe.</small></div><div class="field"><label for="c-candidates">Adaptive market candidates</label><input id="c-candidates" autocomplete="off" required><small>Broker availability, capital fit, spread, ADX, risk and margin determine the active selection.</small></div><div class="form-grid two"><div class="field"><label for="c-dynamic-markets">Adaptive selection</label><select id="c-dynamic-markets"><option value="true">Enabled · recommended</option><option value="false">Disabled · core symbols only</option></select></div><div class="field"><label for="c-market-max">Maximum active markets</label><input id="c-market-max" type="number" min="1" max="12" required></div><div class="field"><label for="c-model-candidates">Model-reviewed markets</label><input id="c-model-candidates" type="number" min="1" max="12" required><small>Highest-ranked markets allowed into the model lane per completed M5 candle.</small></div><div class="field"><label for="c-market-refresh">Market ranking refresh</label><div class="input-unit"><input id="c-market-refresh" type="number" min="30" max="3600" required><span>seconds</span></div></div><div class="field"><label for="c-analysis">Candle polling interval</label><div class="input-unit"><input id="c-analysis" type="number" min="15" max="300" required><span>seconds</span></div></div><div class="field"><label for="c-provider">Decision provider</label><select id="c-provider"><option value="deterministic">Deterministic · no LLM</option><option value="local">Local · LM Studio</option><option value="openai">OpenAI · Responses API</option></select></div><div class="field"><label for="c-model">Decision model</label><input id="c-model" autocomplete="off" required><small id="c-provider-hint">Deterministic rules use completed-candle evidence with no API or model delay.</small></div><div class="field"><label for="c-reasoning">OpenAI reasoning</label><select id="c-reasoning"><option value="none">None · fastest</option><option value="low">Low · recommended for M5</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="max">Maximum</option></select></div></div><div class="field"><label for="c-timeframe">Decision trigger</label><select id="c-timeframe" disabled><option>M5 close · adaptive continuation / pullback / reversal · M15 / H1 / H4 confirmation</option></select></div></section>
         <section class="settings-section">
           <h3>Risk envelope</h3>
           <div class="form-grid two">
@@ -322,12 +336,22 @@
             <div class="field"><label for="c-margin">Maximum margin use</label><div class="input-unit"><input id="c-margin" type="number" min="5" max="90" required><span>%</span></div></div>
             <div class="field"><label for="c-rr">Minimum R:R</label><input id="c-rr" type="number" min="1" max="10" step="0.1" required></div>
             <div class="field"><label for="c-confidence">Confidence gate</label><input id="c-confidence" type="number" min="0.5" max="0.99" step="0.01" required><small>0.70 equals 70% model confidence.</small></div>
+            <div class="field"><label for="c-failed-reversal">Failed-thesis reversal</label><select id="c-failed-reversal"><option value="true">Enabled · deterministic evidence only</option><option value="false">Disabled</option></select><small>Lets a bounded lower-confidence opposite signal reach the normal risk manager after a broker-confirmed loss.</small></div>
+            <div class="field"><label for="c-failed-reversal-confidence">Reversal confidence floor</label><input id="c-failed-reversal-confidence" type="number" min="0.5" max="0.98" step="0.01" required><small>Must remain below the normal confidence gate.</small></div>
+            <div class="field"><label for="c-failed-reversal-bars">Reversal window</label><div class="input-unit"><input id="c-failed-reversal-bars" type="number" min="1" max="36" step="1" required><span>M5 bars</span></div></div>
+            <div class="field"><label for="c-failed-reversal-m5-adx">Reversal M5 ADX</label><input id="c-failed-reversal-m5-adx" type="number" min="0" max="60" step="0.1" required></div>
+            <div class="field"><label for="c-failed-reversal-m15-adx">Reversal M15 ADX</label><input id="c-failed-reversal-m15-adx" type="number" min="0" max="60" step="0.1" required></div>
             <div class="field"><label for="c-spread">Maximum spread</label><input id="c-spread" type="number" min="0.1" max="1000" step="0.1" required><small>Applied in the configured symbol's spread unit.</small></div>
             <div class="field"><label for="c-entry-adx">Minimum entry ADX</label><input id="c-entry-adx" type="number" min="15" max="60" step="0.5" required><small>Fresh M5 momentum required for new entries.</small></div>
             <div class="field"><label for="c-adx-rising">Require rising ADX</label><select id="c-adx-rising"><option value="true">Yes</option><option value="false">No</option></select></div>
             <div class="field"><label for="c-adx-decline">ADX decline tolerance</label><div class="input-unit"><input id="c-adx-decline" type="number" min="0" max="5" step="0.05" required><span>points</span></div><small>Small bar-to-bar ADX noise below this amount is allowed.</small></div>
+            <div class="field"><label for="c-aligned-adx-decline">Aligned ADX decline tolerance</label><div class="input-unit"><input id="c-aligned-adx-decline" type="number" min="0" max="5" step="0.05" required><span>points</span></div><small>Bounded exception only for a fresh M5 trigger with strong, matching M5/M15/H1 direction. It never bypasses the minimum ADX or other risk gates.</small></div>
+            <div class="field"><label for="c-entry-max-extension">Normal anti-chase limit</label><div class="input-unit"><input id="c-entry-max-extension" type="number" min="0.5" max="5" step="0.05" required><span>ATR</span></div><small>Directional M5 extension normally rejected as a late entry.</small></div>
+            <div class="field"><label for="c-aligned-chase-confidence">Aligned continuation confidence</label><input id="c-aligned-chase-confidence" type="number" min="0.5" max="1" step="0.01" required><small>Minimum confidence for the bounded anti-chase exception; never below the normal confidence gate.</small></div>
+            <div class="field"><label for="c-aligned-chase-extension">Aligned continuation limit</label><div class="input-unit"><input id="c-aligned-chase-extension" type="number" min="0.5" max="5" step="0.05" required><span>ATR</span></div><small>Maximum extension only with a fresh structural trigger, exact M5/M15/H1/H4 alignment, and strong momentum. All broker and capital gates still apply.</small></div>
             <div class="field"><label for="c-breakout-displacement">Breakout displacement</label><div class="input-unit"><input id="c-breakout-displacement" type="number" min="0" max="1" step="0.01" required><span>ATR</span></div><small>Rejects tiny level breaches that are more likely to reverse than continue.</small></div>
             <div class="field"><label for="c-zone-distance">Opposing-zone distance</label><div class="input-unit"><input id="c-zone-distance" type="number" min="0" max="5" step="0.05" required><span>ATR</span></div></div>
+            <div class="field"><label for="c-unconfirmed-bos-zone">Unconfirmed BOS zone distance</label><div class="input-unit"><input id="c-unconfirmed-bos-zone" type="number" min="0" max="5" step="0.05" required><span>ATR</span></div><small>Additional room required only when a BOS has no retest, pattern, FVG, or nearby supportive structure.</small></div>
             <div class="field"><label for="c-cost-extension">Cost-aware TP extension</label><div class="input-unit"><input id="c-cost-extension" type="number" min="0" max="2" step="0.05" required><span>R</span></div><small>Bounded extension used only to preserve net R:R after execution reserves.</small></div>
             <div class="field"><label for="c-reentry-bars">Same-thesis re-entry</label><div class="input-unit"><input id="c-reentry-bars" type="number" min="1" max="24" step="1" required><span>M5 bars</span></div></div>
             <div class="field"><label for="c-retest">Pullback-resumption entries</label><select id="c-retest"><option value="true">Enabled · verified retest only</option><option value="false">Disabled</option></select><small>Allows one fresh entry candle when an aligned M5 pullback returns to the confirmed trend.</small></div>
@@ -337,7 +361,7 @@
           </div>
         </section>
         <section class="settings-section"><h3>Profit & loss objectives</h3><p class="section-help">Objectives filter or close positions. They never justify a larger entry risk or stretched take-profit.</p><div class="form-grid two"><div class="field"><label for="c-profit-on">Profit close</label><select id="c-profit-on"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-profit">Profit objective</label><div class="input-unit"><input id="c-profit" type="number" min="0.01" step="0.01"><span>USD</span></div></div><div class="field"><label for="c-loss-on">Loss close</label><select id="c-loss-on"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-loss">Maximum loss</label><div class="input-unit"><input id="c-loss" type="number" min="0.01" step="0.01"><span>USD</span></div></div></div></section>
-        <section class="settings-section"><h3>Professional position monitoring</h3><p class="section-help">Entry signals remain completed-M5 decisions. Open positions receive faster deterministic protection and completed-M1 exit reviews. Profit protection is triggered by each trade's immutable initial risk (R), so it scales across markets.</p><div class="form-grid two"><div class="field"><label for="c-monitor-poll">Protection polling</label><div class="input-unit"><input id="c-monitor-poll" type="number" min="0.5" max="5" step="0.1" required><span>seconds</span></div></div><div class="field"><label for="c-fast-exit">Fast model exit review</label><select id="c-fast-exit"><option value="true">Enabled · M1</option><option value="false">Disabled · M5 only</option></select></div><div class="field"><label for="c-exit-timeframe">Exit evidence</label><select id="c-exit-timeframe"><option value="M1">M1 + M5 confirmation</option><option value="M5">M5 only</option></select></div><div class="field"><label for="c-profit-lock">Cost-aware profit lock</label><select id="c-profit-lock"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-lock-trigger">Profit-lock trigger</label><div class="input-unit"><input id="c-lock-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-lock-floor">Protected net floor</label><div class="input-unit"><input id="c-lock-floor" type="number" min="0" step="0.01" required><span>USD</span></div></div><div class="field"><label for="c-giveback">Peak giveback guard</label><select id="c-giveback"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-giveback-trigger">Giveback trigger</label><div class="input-unit"><input id="c-giveback-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-giveback-fraction">Maximum peak giveback</label><div class="input-unit"><input id="c-giveback-fraction" type="number" min="0.05" max="0.95" step="0.05" required><span>fraction</span></div></div><div class="field"><label for="c-breakeven-r">Secondary break-even</label><div class="input-unit"><input id="c-breakeven-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-r">Trailing-stop trigger</label><div class="input-unit"><input id="c-trailing-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-distance">Trailing distance</label><div class="input-unit"><input id="c-trailing-distance" type="number" min="0.05" max="10" step="0.05" required><span>R</span></div></div></div></section>
+        <section class="settings-section"><h3>Professional position monitoring</h3><p class="section-help">Entry signals remain completed-M5 decisions. Open positions receive faster deterministic protection and completed-M1 exit reviews. Profit protection is triggered by each trade's immutable initial risk (R), so it scales across markets.</p><div class="form-grid two"><div class="field"><label for="c-monitor-poll">Protection polling</label><div class="input-unit"><input id="c-monitor-poll" type="number" min="0.5" max="5" step="0.1" required><span>seconds</span></div></div><div class="field"><label for="c-fast-exit">Fast model exit review</label><select id="c-fast-exit"><option value="true">Enabled · M1</option><option value="false">Disabled · M5 only</option></select></div><div class="field"><label for="c-exit-timeframe">Exit evidence</label><select id="c-exit-timeframe"><option value="M1">M1 + M5 confirmation</option><option value="M5">M5 only</option></select></div><div class="field"><label for="c-profit-lock">Cost-aware profit lock</label><select id="c-profit-lock"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-lock-trigger">Profit-lock trigger</label><div class="input-unit"><input id="c-lock-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-lock-floor">Protected net floor</label><div class="input-unit"><input id="c-lock-floor" type="number" min="0" step="0.01" required><span>USD</span></div></div><div class="field"><label for="c-giveback">Peak giveback guard</label><select id="c-giveback"><option value="true">Enabled</option><option value="false">Disabled</option></select></div><div class="field"><label for="c-giveback-trigger">Giveback tracking trigger</label><div class="input-unit"><input id="c-giveback-trigger" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-giveback-close-min">Full-close maturity</label><div class="input-unit"><input id="c-giveback-close-min" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div><small>Below this peak, the broker profit floor and confirmed M1 reversal exits remain active without an ordinary giveback market close.</small></div><div class="field"><label for="c-giveback-fraction">Maximum peak giveback</label><div class="input-unit"><input id="c-giveback-fraction" type="number" min="0.05" max="0.95" step="0.05" required><span>fraction</span></div></div><div class="field"><label for="c-breakeven-r">Secondary break-even</label><div class="input-unit"><input id="c-breakeven-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-r">Trailing-stop trigger</label><div class="input-unit"><input id="c-trailing-r" type="number" min="0.1" max="10" step="0.05" required><span>R</span></div></div><div class="field"><label for="c-trailing-distance">Trailing distance</label><div class="input-unit"><input id="c-trailing-distance" type="number" min="0.05" max="10" step="0.05" required><span>R</span></div></div></div></section>
         <section class="settings-section"><h3>Weekend crypto</h3><div class="form-grid two"><div class="field"><label for="c-weekend">Weekend trading</label><select id="c-weekend"><option value="false">Off</option><option value="true">On</option></select></div><div class="field"><label for="c-weekend-symbols">Weekend symbols</label><input id="c-weekend-symbols" autocomplete="off"></div></div></section>
         <div class="settings-notice"><strong>Restart required</strong><span>Saved settings apply after restart. Session arming is cleared; explicitly enabled account-bound autonomy may restore only after health checks pass.</span></div>
       </div>

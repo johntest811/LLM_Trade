@@ -33,12 +33,13 @@ def setup_logger(
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # Rotating File Handler (10MB limit per file, keeping 5 backup files)
+    # Bound unattended disk use: current log + two 5 MB rotations. Runtime
+    # history belongs in SQLite; diagnostic text must not grow indefinitely.
     os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
     file_handler = RotatingFileHandler(
         log_file,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8",
         errors="replace",
     )

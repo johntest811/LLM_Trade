@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app_config.settings import settings
-
-
 class PromptTemplateBuilder:
     @staticmethod
     def get_compact_schema() -> str:

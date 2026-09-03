@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import re
-from typing import Any, Dict, Iterable, Mapping, Tuple
+from typing import Any, Iterable, Mapping, Tuple
 
 
 TIMEFRAMES: Tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
@@ -196,4 +196,18 @@ def has_directional_m5_trigger(evidence_ids: Iterable[str], action: str) -> bool
     ) or any(
         str(identifier).startswith(f"M5_RANGE_{direction}_")
         for identifier in evidence_ids
+    )
+
+
+def permitted_entry_actions(evidence_ids: Iterable[str]) -> Tuple[str, ...]:
+    """Return directions that completed-M5 evidence permits a model to confirm.
+
+    The model may still veto a structured candidate with HOLD, but it cannot
+    introduce a direction that deterministic entry evidence did not produce.
+    """
+    catalog = tuple(evidence_ids)
+    return tuple(
+        action
+        for action in ("BUY", "SELL")
+        if has_directional_m5_trigger(catalog, action)
     )

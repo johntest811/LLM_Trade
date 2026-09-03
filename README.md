@@ -1,5 +1,34 @@
 # LLM Trading Terminal
 
+## Laptop 24/7 profile
+
+The MSI GF63 11UCX has an RTX 2050 Laptop GPU with 4 GB VRAM. A 9B Q6/Q8
+model will spill into system RAM and is not an appropriate low-latency 24/7
+profile for that machine. Use LM Studio's `qwen/qwen3.5-4b` model with the
+Q4_K_M GGUF on a 4 GB machine, keep thinking disabled, and merge the non-secret
+values from `.env.laptop.example` into the laptop's private `.env`. The local
+provider accepts both the catalog ID `qwen/qwen3.5-4b` and LM Studio's shorter
+loaded API identifier `qwen3.5-4b`.
+
+The 4,096-token context is intentional: measured entry prompts are about 1,000
+tokens and responses remain below the 220-token cap. Larger context does not
+add market evidence, but it reserves more KV-cache memory and can increase
+latency. Keep `LOCAL_LLM_STRUCTURED_OUTPUT=True`; LM Studio's global Structured
+Output toggle may remain off because the application sends the schema itself.
+
+Run exactly one armed engine per Pepperstone account. The workspace mutex is
+local to one computer; simultaneously arming the desktop and laptop can create
+duplicate orders and split risk/history state. During migration, stop the
+desktop engine with no open positions, copy the private `.env` and
+`trading_system.db`, start LM Studio and MT5 on the laptop, then launch
+`run_unattended.ps1`. A second installation should remain disarmed standby.
+
+Official hardware and model references:
+
+- https://www.msi.com/Laptop/GF63-Thin-11UCX-s/Specification
+- https://lmstudio.ai/models/qwen/qwen3.5-4b
+- https://huggingface.co/Qwen/Qwen3.5-4B
+
 A loopback-only trading workstation for Pepperstone MetaTrader 5. It combines
 deterministic price planning, broker-native risk and margin checks, position
 protection, and a provider-aware decision service used only as one directional
@@ -46,15 +75,30 @@ strategy's expectancy.
 - Reviews managed positions on every completed **M1** candle using M1/M5
   structure evidence while M5 remains the only entry timeframe.
 - Polls broker positions every 0.5 seconds, persists each ticket's best
-  broker-reported floating P/L, and manages profit in original-risk (R) units:
-  the live profile can protect retained progress after +0.5R, move toward
-  break-even, trail after +1R, and retire a stagnant setup after 12 M5 bars.
+  broker-reported floating P/L, and manages profit in original-risk (R) units.
+  The first broker profit floor requires both +$0.35 estimated net and +0.50R
+  before protecting +$0.08. At +$0.60 and +0.75R it protects 35% of current
+  net profit, and at +$1.15 it attempts to protect +$1.00. Break-even remains
+  at +0.75R, trailing starts at +1.00R, and stagnant setups retire after 12 M5
+  bars.
 - Runs deterministic analysis across the active market universe, then sends
-  only the top three capital-fit, prefilter-passing setups to the serial local
-  model queue. This keeps later decisions inside the fresh-candle window.
+  only the configured number of top-ranked, capital-fit setups to the serial
+  local-model queue (three on the desktop profile, two on the 4 GB laptop).
+  This keeps later decisions inside the fresh-candle window.
 - Records valid BUY/SELL signals rejected by confidence, risk, or shadow mode
   and evaluates their 60-minute broker-M1 outcomes. This telemetry is
   diagnostic only and never bypasses a gate or places an order.
+- Keeps the normal entry-confidence floor at 70%. A 60-69% decision can proceed
+  only as a bounded failed-thesis reversal: the latest opposite-direction trade
+  must be a broker-confirmed loss, and fresh M5/M15 direction, structure,
+  reversal-pattern, and strengthening-momentum checks must all agree. The
+  planner, sizing, spread, margin, portfolio, and broker gates still apply.
+- Shows a rolling 48-hour BUY/SELL funnel with candidate, rejection, execution,
+  closed-P/L, and rejected-signal expectancy metrics. This makes directional
+  skew visible without automatically weakening one side after a small sample.
+- A modest M5 ADX decline may reach the model only when a fresh deterministic
+  M5 trigger remains strong and M5/M15/H1 direction agrees. The complete risk
+  gate repeats this check, so market discovery cannot authorize an order.
 - Manages break-even, trailing protection, optional profit/loss exits, and
   manual close or SL/TP updates from the terminal.
 
@@ -157,7 +201,12 @@ net R:R above the final gate when desired.
      3060, Q6 is preferred over Q8 for this multi-market workflow because it
      leaves more VRAM headroom and shortens the serial inference queue; final
      price, spread, structure, risk, margin, R:R, and `order_check` validation
-     remain deterministic and unchanged.
+     remain deterministic and unchanged. With
+     `DETERMINISTIC_ENTRY_FAST_PATH_ENABLED=true`, a uniquely directional,
+     fresh, fully aligned M5/M15/H1/H4 setup uses the millisecond rules policy
+     instead of waiting behind the local-model queue. Ambiguous setups still
+     use the configured model or HOLD, and every downstream safety gate remains
+     mandatory.
    - OpenAI opt-in: configure these values in `.env` and restart the process:
 
      ```dotenv
@@ -235,13 +284,22 @@ outage.
 - Profit peaks are account-and-ticket scoped and persisted. A restart therefore
   cannot erase the fact that a still-open trade previously crossed the
   configured profit-protection trigger.
-- Once a position reaches the configured mid-profit threshold (0.5R by
-  default), its broker-side profit floor retains the configured share of the
-  cost-adjusted peak. The giveback guard uses the same threshold as a fallback
-  without shortening the original stop before that progress exists.
+- Profit locks use current cost-adjusted profit, not a past peak. The first two
+  tiers require their USD and R thresholds simultaneously; the final +$1.15
+  tier can still attempt its +$1.00 floor if a restart cannot reconstruct R.
+  Successful tiers are remembered per ticket so later tiers can upgrade the
+  broker stop without repeating the same modification every poll. An ordinary
+  giveback cannot market-close a position with a valid risk baseline until its
+  peak reaches 1R by default; completed-M1 adverse-structure management and the
+  broker stop remain active below that threshold.
 - An exhausted same-candle M5 BOS/breakout must also have a verified retest, a
   directional candle pattern, or an actual H1/H4 structure event. Higher-
   timeframe direction labels alone cannot authorize that chased setup.
+- The normal anti-chase limit remains 1.50 ATR. A 1.50-2.00 ATR continuation
+  can proceed only with at least 85% confidence, a fresh BOS/retest/confirmed
+  CHoCH, exact M5/M15/H1/H4 alignment, and independently strong momentum. This
+  exception does not apply to breakout-only signals and does not bypass spread,
+  shock, R:R, re-entry, sizing, portfolio-risk, margin, or broker checks.
 - Break-even protection is account-and-ticket scoped and becomes satisfied
   when the existing broker stop is already stronger, avoiding repeated MT5
   modification requests during the 0.5-second protection loop.
@@ -334,12 +392,18 @@ ASK and a SELL opens at BID. Spread calculations always use `ask - bid`.
 
 ## Optional LM Studio guidance
 
-For an RTX 3060 12 GB, a 4-bit Qwen3.5 9B build is a practical low-latency
-default. A much larger model that spills into system RAM can allow a decision
-to become stale before execution; a deterministic, fast 9B response is more
-useful here than a slow 26B response.
+For an RTX 3060 12 GB, Qwen3.5 9B Q6 remains an optional higher-capacity local
+profile; Q8 consumes more VRAM and does not improve deterministic price, risk,
+or broker validation. The active low-latency profile now uses Qwen3.5 4B. For
+the 4 GB RTX 2050 laptop, use its Q4_K_M build as described above. A model that
+spills heavily into system RAM can let a decision become stale before execution.
 
-- Leave **Enable Thinking off** for the automated M5 loop.
+- Leave **Enable Thinking** and **Preserve Thinking** off for the automated M5
+  loop. Supported Qwen3.5 and `prism-ml/bonsai-27b` requests also send LM Studio
+  `reasoning_effort=none`, preventing hidden reasoning from consuming the
+  bounded 220-token decision response before JSON is produced. Bonsai's native
+  Q1_0 quantization is accepted only for that named model; Q1_0 remains blocked
+  for ordinary local models.
 - Turn LM Studio's global **Structured Output** toggle off if its schema box is
   empty. Keep `LOCAL_LLM_STRUCTURED_OUTPUT=True`; the application sends its own
   strict schema with each request.

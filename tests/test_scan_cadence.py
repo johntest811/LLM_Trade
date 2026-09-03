@@ -26,7 +26,8 @@ class _Reader:
             )
         return frame
 
-    async def get_live_tick(self, symbol):
+    async def get_live_tick(self, symbol, assume_connected=False):
+        del assume_connected
         return {"bid": 1.1000, "ask": 1.1001} if self.live_tick else None
 
 
@@ -37,6 +38,13 @@ class _Analyzer:
             "market_structure": {
                 "trend": "BEARISH",
                 "trend_state": "EARLY_BULLISH_REVERSAL",
+                "structure_events": [
+                    {
+                        "type": "BOS",
+                        "direction": "BEARISH",
+                        "time": "2026-08-12 05:10:00+00:00",
+                    }
+                ],
             },
             "timeframe": timeframe,
         }
@@ -46,6 +54,13 @@ class _WeakAnalyzer(_Analyzer):
     def analyze(self, symbol, timeframe, candles):
         result = super().analyze(symbol, timeframe, candles)
         result["indicators"]["adx_14"] = 12.0
+        return result
+
+
+class _NoTriggerAnalyzer(_Analyzer):
+    def analyze(self, symbol, timeframe, candles):
+        result = super().analyze(symbol, timeframe, candles)
+        result["market_structure"]["structure_events"] = []
         return result
 
 
@@ -248,7 +263,7 @@ class ScanCadenceTests(unittest.TestCase):
         engine.conn = SimpleNamespace(is_connected=AsyncMock(return_value=True))
         engine.reader = SimpleNamespace(
             get_live_tick=AsyncMock(
-                side_effect=lambda symbol: {
+                side_effect=lambda symbol, assume_connected=False: {
                     "time_msc": {
                         "ETHUSD": 1,
                         "LTCUSD": 2,
@@ -285,6 +300,12 @@ class ScanCadenceTests(unittest.TestCase):
             [call.args[0] for call in engine.reader.get_live_tick.await_args_list],
             ["ETHUSD", "LTCUSD", "XRPUSD"],
         )
+        self.assertTrue(
+            all(
+                call.kwargs.get("assume_connected") is True
+                for call in engine.reader.get_live_tick.await_args_list
+            )
+        )
 
     def test_deterministic_entry_prefilter_skips_impossible_model_request(self):
         llm = _LLM()
@@ -314,6 +335,40 @@ class ScanCadenceTests(unittest.TestCase):
             reader.calls, {"M5": 1, "M15": 1, "H1": 1, "H4": 1}
         )
 
+    def test_no_actionable_m5_evidence_does_not_consume_model_capacity(self):
+        llm = _LLM()
+        reader = _Reader()
+        engine = TradingEngine(
+            object(), reader, object(), llm, _Database(), object()
+        )
+        engine.analyzer = _NoTriggerAnalyzer()
+        engine.log = lambda *args, **kwargs: None
+
+        with (
+            patch("core.engine.is_weekend", return_value=False),
+            patch(
+                "core.engine.DeterministicTradePlanner.assess_capital_fit",
+                return_value={"capital_fit": True, "status": "CAPITAL FIT"},
+            ),
+            patch(
+                "core.engine.dashboard_state.update_symbol_decision"
+            ) as update_decision,
+        ):
+            asyncio.run(
+                engine._evaluate_symbol("USDJPY", {"balance": 15.0}, [])
+            )
+
+        self.assertEqual(llm.calls, 0)
+        self.assertEqual(
+            engine.last_bar_times["USDJPY"], "M5-closed-bar"
+        )
+        self.assertTrue(
+            any(
+                call.kwargs.get("stage") == "NO ENTRY EVIDENCE"
+                for call in update_decision.call_args_list
+            )
+        )
+
     def test_entry_prefilter_ignores_small_adx_measurement_noise(self):
         reason = TradingEngine._entry_prefilter_reason(
             {"indicators": {"adx_14": 25.0, "adx_delta": -0.25}}
@@ -325,6 +380,70 @@ class ScanCadenceTests(unittest.TestCase):
         reason = TradingEngine._entry_prefilter_reason(
             {"indicators": {"adx_14": 25.0, "adx_delta": -0.75}}
         )
+
+        self.assertIn("ADX Prefilter", reason)
+
+    def test_entry_prefilter_allows_bounded_aligned_structure_decline(self):
+        configured = replace(
+            settings,
+            entry_min_adx=15.0,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=20.0,
+            entry_adx_decline_tolerance=0.5,
+            entry_aligned_adx_decline_tolerance=1.5,
+        )
+        for direction in ("BULLISH", "BEARISH"):
+            with self.subTest(direction=direction):
+                analyses = []
+                for timeframe in ("M5", "M15", "H1"):
+                    analyses.append({
+                        "indicators": {
+                            "adx_14": 30.0,
+                            "adx_delta": -1.0 if timeframe == "M5" else 0.5,
+                        },
+                        "market_structure": {
+                            "trend_state_direction": direction,
+                            "structure_events": ([{
+                                "type": "BOS",
+                                "direction": direction,
+                            }] if timeframe == "M5" else []),
+                        },
+                    })
+
+                with patch("core.engine.settings", configured):
+                    reason = TradingEngine._entry_prefilter_reason(*analyses)
+
+                self.assertEqual(reason, "")
+
+    def test_entry_prefilter_does_not_bridge_opposing_confirmation(self):
+        m5 = {
+            "indicators": {"adx_14": 30.0, "adx_delta": -1.0},
+            "market_structure": {
+                "trend_state_direction": "BULLISH",
+                "structure_events": [{
+                    "type": "BOS",
+                    "direction": "BULLISH",
+                }],
+            },
+        }
+        m15 = {
+            "indicators": {"adx_14": 30.0},
+            "market_structure": {"trend_state_direction": "BEARISH"},
+        }
+        h1 = {
+            "indicators": {"adx_14": 30.0},
+            "market_structure": {"trend_state_direction": "BULLISH"},
+        }
+        configured = replace(
+            settings,
+            entry_adx_decline_tolerance=0.5,
+            entry_aligned_adx_decline_tolerance=1.5,
+            breakout_min_adx=25.0,
+            confirmation_min_adx=20.0,
+        )
+
+        with patch("core.engine.settings", configured):
+            reason = TradingEngine._entry_prefilter_reason(m5, m15, h1)
 
         self.assertIn("ADX Prefilter", reason)
 

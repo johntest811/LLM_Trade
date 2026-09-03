@@ -48,7 +48,10 @@ class DecisionScoringEngine:
 
         # 1. Trend Alignment (M5, M15, H1, H4 alignment)
         normalized_mode = str(strategy_mode).upper()
-        reversal = normalized_mode == "CONFIRMED_REVERSAL"
+        reversal = normalized_mode in {
+            "CONFIRMED_REVERSAL",
+            "FAILED_THESIS_REVERSAL",
+        }
         range_mode = normalized_mode == "RANGE_REVERSION"
         range_setup = struct_m5.get("range_reversion", {}) or {}
         range_matches = bool(

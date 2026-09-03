@@ -315,6 +315,64 @@ class AdaptiveMarketSelectorTests(unittest.TestCase):
 
 
 class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_model_eligibility_requires_actionable_m5_evidence(self):
+        frame = MagicMock()
+        frame.empty = False
+        frame.attrs = {}
+        reader = MagicMock()
+        reader.get_ohlcv = AsyncMock(return_value=frame)
+        database = MagicMock()
+        database.get_closed_positions = AsyncMock(return_value=[])
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.reader = reader
+        engine.db = database
+        base_analysis = {
+            "timestamp": "2026-08-12 05:10:00+00:00",
+            "indicators": {"adx_14": 30.0, "adx_delta": 1.0},
+            "market_structure": {
+                "trend": "BULLISH",
+                "trend_state": "CONFIRMED_BULLISH",
+                "trend_state_direction": "BULLISH",
+                "structure_events": [],
+                "breakout_status": "NONE",
+            },
+        }
+        engine.analyzer = MagicMock()
+        engine.analyzer.analyze.return_value = base_analysis
+
+        with (
+            patch("core.engine.annotate_range_reversion"),
+            patch(
+                "core.engine.DeterministicTradePlanner.assess_capital_fit",
+                side_effect=lambda *args: {
+                    "capital_fit": True,
+                    "broker_open": True,
+                    "spread_value": 1.0,
+                    "asset_class": "FX/CFD",
+                },
+            ),
+            patch("core.engine.dashboard_state.update_market_fit"),
+        ):
+            no_trigger = await engine._assess_market_candidate(
+                "USDJPY", {"login": 1}
+            )
+            base_analysis["market_structure"]["structure_events"] = [
+                {
+                    "type": "BOS",
+                    "direction": "BULLISH",
+                    "time": "2026-08-12 05:10:00+00:00",
+                }
+            ]
+            with_trigger = await engine._assess_market_candidate(
+                "USDJPY", {"login": 1}
+            )
+
+        self.assertFalse(no_trigger["actionable_entry_evidence"])
+        self.assertFalse(no_trigger["model_eligible"])
+        self.assertTrue(with_trigger["actionable_entry_evidence"])
+        self.assertEqual(with_trigger["permitted_entry_actions"], ["BUY"])
+        self.assertTrue(with_trigger["model_eligible"])
+
     async def test_refresh_ranks_open_markets_independently_of_capital_fit(self):
         isolated = replace(
             settings,

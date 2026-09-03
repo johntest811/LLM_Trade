@@ -7,9 +7,10 @@ and outputs (LLM decisions, scoring, outcomes) to allow exact strategy auditing 
 import json
 import sqlite3
 import logging
+import re
 from contextlib import closing
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app_config.paths import DEFAULT_DB_PATH
 from app_config.settings import settings
@@ -276,7 +277,13 @@ class TradeReplayLogger:
             return False
 
     def shadow_summary(self) -> Dict[str, Any]:
-        """Return compact evidence metrics; ambiguous paths are not scored."""
+        """Return compact rejected-signal and direction-funnel diagnostics.
+
+        The rolling directional view is intentionally diagnostic. It exposes
+        whether BUY and SELL candidates are generated and approved at similar
+        rates without allowing recent outcomes to mutate live risk settings.
+        """
+        evidence_window_hours = 48
         empty = {
             "pending": 0,
             "resolved": 0,
@@ -285,6 +292,9 @@ class TradeReplayLogger:
             "ambiguous": 0,
             "win_rate_pct": 0.0,
             "expectancy_r": 0.0,
+            "gate_breakdown": [],
+            "evidence_window_hours": evidence_window_hours,
+            "direction_breakdown": [],
         }
         try:
             with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
@@ -302,10 +312,161 @@ class TradeReplayLogger:
                     FROM shadow_outcome
                     """
                 ).fetchone()
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(hours=evidence_window_hours)
+                ).isoformat()
+                recent_rows = conn.execute(
+                    """
+                    SELECT action, rejection_stage, rejection_reason, outcome_r
+                    FROM shadow_outcome
+                    WHERE created_at_utc >= ?
+                      AND status <> 'PENDING'
+                      AND outcome_r IS NOT NULL
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                local_cutoff = (
+                    datetime.now() - timedelta(hours=evidence_window_hours)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                replay_rows = conn.execute(
+                    """
+                    SELECT action, status, pnl
+                    FROM trade_replay
+                    WHERE time >= ? AND action IN ('BUY', 'SELL')
+                    """,
+                    (local_cutoff,),
+                ).fetchall()
             values = dict(row or {})
             wins = int(values.get("wins") or 0)
             losses = int(values.get("losses") or 0)
             scored = wins + losses
+            gates: Dict[str, Dict[str, Any]] = {}
+            for recent in recent_rows:
+                stage = str(recent["rejection_stage"] or "").strip()
+                reason = str(recent["rejection_reason"] or "").strip()
+                match = re.search(r"REJECTED \[([^]]+)\]", reason)
+                gate = (
+                    match.group(1)
+                    if match
+                    else (
+                        "Confidence"
+                        if stage == "BELOW CONFIDENCE"
+                        else stage.replace(" REJECTED", "").title()
+                    )
+                )
+                outcome = float(recent["outcome_r"])
+                item = gates.setdefault(
+                    gate,
+                    {"gate": gate, "resolved": 0, "wins": 0, "losses": 0, "total_r": 0.0},
+                )
+                item["resolved"] += 1
+                item["wins"] += int(outcome > 0)
+                item["losses"] += int(outcome < 0)
+                item["total_r"] += outcome
+            gate_breakdown = []
+            for item in sorted(
+                gates.values(),
+                key=lambda value: (-value["resolved"], value["gate"]),
+            )[:5]:
+                resolved = int(item["resolved"])
+                gate_breakdown.append(
+                    {
+                        "gate": item["gate"],
+                        "resolved": resolved,
+                        "wins": int(item["wins"]),
+                        "losses": int(item["losses"]),
+                        "expectancy_r": round(item["total_r"] / resolved, 3),
+                    }
+                )
+            direction_breakdown = []
+            for action in ("BUY", "SELL"):
+                action_replays = [
+                    item
+                    for item in replay_rows
+                    if str(item["action"] or "").upper() == action
+                ]
+                rejected = sum(
+                    str(item["status"] or "").upper().startswith("REJECTED:")
+                    for item in action_replays
+                )
+                executed_rows = [
+                    item
+                    for item in action_replays
+                    if str(item["status"] or "").upper() == "CLOSED"
+                    or str(item["status"] or "").upper().startswith("OPEN")
+                ]
+                closed_rows = [
+                    item
+                    for item in action_replays
+                    if str(item["status"] or "").upper() == "CLOSED"
+                ]
+                shadow_rows = [
+                    item
+                    for item in recent_rows
+                    if str(item["action"] or "").upper() == action
+                ]
+                shadow_outcomes = [
+                    float(item["outcome_r"]) for item in shadow_rows
+                ]
+                rejection_gates: Dict[str, int] = {}
+                for item in shadow_rows:
+                    stage = str(item["rejection_stage"] or "").strip()
+                    reason = str(item["rejection_reason"] or "").strip()
+                    match = re.search(r"REJECTED \[([^]]+)\]", reason)
+                    gate = (
+                        match.group(1)
+                        if match
+                        else (
+                            "Confidence"
+                            if stage == "BELOW CONFIDENCE"
+                            else stage.replace(" REJECTED", "").title()
+                        )
+                    )
+                    rejection_gates[gate] = rejection_gates.get(gate, 0) + 1
+                top_rejection_gates = [
+                    {"gate": gate, "count": count}
+                    for gate, count in sorted(
+                        rejection_gates.items(),
+                        key=lambda value: (-value[1], value[0]),
+                    )[:3]
+                ]
+                candidates = len(action_replays)
+                executed = len(executed_rows)
+                direction_breakdown.append(
+                    {
+                        "action": action,
+                        "candidates": candidates,
+                        "rejected": rejected,
+                        "executed": executed,
+                        "approval_rate_pct": round(
+                            100.0 * executed / candidates, 1
+                        ) if candidates else 0.0,
+                        "closed_wins": sum(
+                            float(item["pnl"] or 0.0) > 0.0
+                            for item in closed_rows
+                        ),
+                        "closed_losses": sum(
+                            float(item["pnl"] or 0.0) < 0.0
+                            for item in closed_rows
+                        ),
+                        "closed_net_usd": round(
+                            sum(
+                                float(item["pnl"] or 0.0)
+                                for item in closed_rows
+                            ),
+                            2,
+                        ),
+                        "shadow_resolved": len(shadow_outcomes),
+                        "shadow_positive": sum(
+                            outcome > 0.0 for outcome in shadow_outcomes
+                        ),
+                        "shadow_expectancy_r": round(
+                            sum(shadow_outcomes) / len(shadow_outcomes), 3
+                        ) if shadow_outcomes else 0.0,
+                        "top_rejection_gates": top_rejection_gates,
+                    }
+                )
             return {
                 "pending": int(values.get("pending") or 0),
                 "resolved": int(values.get("resolved") or 0),
@@ -314,6 +475,9 @@ class TradeReplayLogger:
                 "ambiguous": int(values.get("ambiguous") or 0),
                 "win_rate_pct": round(100.0 * wins / scored, 1) if scored else 0.0,
                 "expectancy_r": round(float(values.get("expectancy_r") or 0.0), 3),
+                "gate_breakdown": gate_breakdown,
+                "evidence_window_hours": evidence_window_hours,
+                "direction_breakdown": direction_breakdown,
             }
         except Exception as exc:
             logger.error("Error summarizing shadow outcomes: %s", exc)
@@ -465,6 +629,25 @@ class TradeReplayLogger:
         try:
             conn = sqlite3.connect(self.db_path, timeout=10.0)
             cursor = conn.cursor()
+            existing = cursor.execute(
+                "SELECT close_reason FROM trade_replay WHERE ticket = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (ticket,),
+            ).fetchone()
+            existing_reason = str(existing[0] or "").strip() if existing else ""
+            candidate_reason = str(close_reason or "").strip()
+            # MT5 commonly reconciles application closes as generic EXPERT
+            # exits. Preserve the strategy cause recorded at submission time,
+            # while still allowing broker TP/SL reasons to fill an empty row.
+            generic_reasons = {"", "EXPERT", "CLIENT", "MOBILE", "WEB", "UNKNOWN"}
+            if (
+                existing_reason
+                and existing_reason.upper() not in generic_reasons
+                and candidate_reason.upper() in generic_reasons
+            ):
+                final_close_reason = existing_reason
+            else:
+                final_close_reason = candidate_reason or existing_reason
             cursor.execute("""
                 UPDATE trade_replay
                 SET pnl = ?, status = 'CLOSED', close_time = ?,
@@ -474,7 +657,7 @@ class TradeReplayLogger:
             """, (
                 pnl,
                 close_time or datetime.now().isoformat(),
-                close_reason,
+                final_close_reason,
                 mfe_pips,
                 mae_pips,
                 mfe_usd,

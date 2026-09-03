@@ -5,6 +5,37 @@ from ui.state import DashboardState
 
 
 class DashboardStateTests(unittest.TestCase):
+    def test_compact_wire_state_omits_engine_only_planner_payload(self):
+        state = DashboardState()
+        state.update_market_fit(
+            "USDJPY",
+            {
+                "status": "CAPITAL FIT",
+                "capital_fit": True,
+                "reason": "Executable",
+                "selection_score": 91.0,
+                "directions": {
+                    "BUY": {
+                        "capital_fit": True,
+                        "plan": {"entry": 150.0, "private": "engine-only"},
+                    },
+                    "SELL": {"capital_fit": False, "plan": {"entry": 149.9}},
+                },
+                "performance": {"trades": list(range(100))},
+                "forex_context": {"private": "engine-only"},
+            },
+        )
+        state.add_tick("USDJPY", 150.0, 150.01)
+
+        payload = state.to_dict(compact=True, include_tick_stream=False)
+        fit = payload["market_fits"]["USDJPY"]
+
+        self.assertEqual(fit["selection_score"], 91.0)
+        self.assertEqual(fit["directions"]["BUY"], {"capital_fit": True})
+        self.assertNotIn("performance", fit)
+        self.assertNotIn("forex_context", fit)
+        self.assertEqual(payload["tick_stream"], [])
+
     def test_shadow_metrics_are_serialized(self):
         state = DashboardState()
         state.update_shadow(
@@ -15,6 +46,28 @@ class DashboardStateTests(unittest.TestCase):
             losses=1,
             win_rate_pct=75.0,
             expectancy_r=0.42,
+            gate_breakdown=[
+                {
+                    "gate": "Structure Gate",
+                    "resolved": 4,
+                    "wins": 1,
+                    "losses": 3,
+                    "expectancy_r": -0.25,
+                }
+            ],
+            evidence_window_hours=48,
+            direction_breakdown=[
+                {
+                    "action": "BUY",
+                    "candidates": 12,
+                    "rejected": 10,
+                    "executed": 2,
+                    "approval_rate_pct": 16.7,
+                    "shadow_resolved": 8,
+                    "shadow_positive": 5,
+                    "shadow_expectancy_r": 0.12,
+                }
+            ],
         )
 
         payload = state.to_dict()
@@ -22,6 +75,15 @@ class DashboardStateTests(unittest.TestCase):
         self.assertTrue(payload["shadow"]["enabled"])
         self.assertEqual(payload["shadow"]["resolved"], 4)
         self.assertEqual(payload["shadow"]["expectancy_r"], 0.42)
+        self.assertEqual(
+            payload["shadow"]["gate_breakdown"][0]["gate"],
+            "Structure Gate",
+        )
+        self.assertEqual(payload["shadow"]["evidence_window_hours"], 48)
+        self.assertEqual(
+            payload["shadow"]["direction_breakdown"][0]["action"],
+            "BUY",
+        )
 
     def test_symbol_decisions_serialize_independently(self):
         state = DashboardState()

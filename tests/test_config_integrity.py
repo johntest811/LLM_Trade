@@ -10,6 +10,21 @@ from database.replay_logger import TradeReplayLogger
 
 
 class ConfigIntegrityTests(unittest.TestCase):
+    def test_requested_protection_profile_is_the_default_contract(self):
+        self.assertEqual(settings.profit_lock_trigger_usd, 0.35)
+        self.assertEqual(settings.profit_lock_trigger_r, 0.50)
+        self.assertEqual(settings.profit_lock_floor_usd, 0.08)
+        self.assertEqual(settings.profit_lock_mid_trigger_usd, 0.60)
+        self.assertEqual(settings.profit_lock_mid_trigger_r, 0.75)
+        self.assertEqual(settings.profit_lock_mid_fraction, 0.35)
+        self.assertEqual(settings.profit_lock_final_trigger_usd, 1.15)
+        self.assertEqual(settings.profit_lock_final_floor_usd, 1.00)
+        self.assertEqual(settings.breakeven_trigger_r, 0.75)
+        self.assertEqual(settings.trailing_trigger_r, 1.00)
+        self.assertEqual(settings.failed_thesis_reversal_min_confidence, 0.60)
+        self.assertEqual(settings.same_thesis_reentry_min_bars, 2)
+        self.assertFalse(hasattr(settings, "early_profit_lock_enabled"))
+
     def test_workspace_env_has_unique_keys(self):
         self.assertEqual(duplicate_env_keys(ENV_PATH), {})
 
@@ -84,6 +99,87 @@ class ConfigIntegrityTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(decision_value, settings.config_fingerprint)
             self.assertEqual(replay_value, settings.config_fingerprint)
+
+    def test_strategy_close_reason_survives_generic_broker_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "audit.db"
+            replay = TradeReplayLogger(str(db_path))
+            replay_id = replay.log_replay_attempt(
+                symbol="NZDUSD",
+                action="BUY",
+                prompt_text="test",
+                llm_json={"action": "BUY", "confidence": 0.85},
+                indicators={},
+                market_structure={},
+                quality_score=75.0,
+                confluence_score=75.0,
+                status="OPENED",
+                ticket=12345,
+            )
+            self.assertIsNotNone(replay_id)
+
+            self.assertTrue(
+                replay.update_replay_outcome(
+                    12345,
+                    -0.42,
+                    close_reason="STAGNATION_EXIT",
+                )
+            )
+            self.assertTrue(
+                replay.update_replay_outcome(
+                    12345,
+                    -0.42,
+                    close_reason="EXPERT",
+                    mfe_usd=0.40,
+                    mae_usd=-0.46,
+                )
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                reason, mfe_usd, mae_usd = conn.execute(
+                    "SELECT close_reason, mfe_usd, mae_usd "
+                    "FROM trade_replay WHERE id = ?",
+                    (replay_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(reason, "STAGNATION_EXIT")
+            self.assertAlmostEqual(mfe_usd, 0.40)
+            self.assertAlmostEqual(mae_usd, -0.46)
+
+    def test_broker_close_reason_populates_empty_replay_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "audit.db"
+            replay = TradeReplayLogger(str(db_path))
+            replay.log_replay_attempt(
+                symbol="CADJPY",
+                action="BUY",
+                prompt_text="test",
+                llm_json={"action": "BUY", "confidence": 0.85},
+                indicators={},
+                market_structure={},
+                quality_score=80.0,
+                confluence_score=80.0,
+                status="OPENED",
+                ticket=67890,
+            )
+            self.assertTrue(
+                replay.update_replay_outcome(
+                    67890,
+                    2.38,
+                    close_reason="TAKE_PROFIT",
+                )
+            )
+            conn = sqlite3.connect(db_path)
+            try:
+                reason = conn.execute(
+                    "SELECT close_reason FROM trade_replay WHERE ticket = ?",
+                    (67890,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(reason, "TAKE_PROFIT")
 
 
 if __name__ == "__main__":

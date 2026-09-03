@@ -93,6 +93,24 @@ class DecisionValidatorTests(unittest.TestCase):
         self.assertTrue(ok, error)
         self.assertEqual(decision["evidence_ids"], allowed)
 
+    def test_entry_cannot_leave_deterministic_direction_contract(self):
+        allowed = [
+            "M5_BOS_BULLISH_20260811T1340",
+            "M5_BOS_BEARISH_20260811T1340",
+        ]
+        ok, _, error = DecisionValidator.validate_decision(
+            {
+                "action": "SELL",
+                "confidence": 0.85,
+                "evidence_ids": ["M5_BOS_BEARISH_20260811T1340"],
+            },
+            allowed_evidence_ids=allowed,
+            permitted_actions=("BUY",),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("deterministic entry contract", error)
+
     def test_entry_resolves_descriptive_breakout_alias_to_allowed_m5_id(self):
         allowed = [
             "M5_TREND_BEARISH",

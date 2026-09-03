@@ -10,11 +10,11 @@ import logging
 import math
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 from mt5.safe_api import mt5
-import pandas as pd
 
 from app_config.settings import settings
 from ui.state import dashboard_state
@@ -22,6 +22,7 @@ from core.analysis_engine import MarketAnalysisEngine
 from core.forex_context import build_currency_context
 from core.market_selector import AdaptiveMarketSelector
 from core.entry_retest import annotate_retest_continuation
+from core.entry_momentum import aligned_structure_allows_adx_decline
 from core.range_reversion import annotate_range_reversion
 from core.shadow_outcomes import evaluate_shadow_candidate
 from core.trade_planner import DeterministicTradePlanner, TradePlan
@@ -30,7 +31,12 @@ from risk.manager import RiskManager
 from risk.instruments import downside_risk_usd, pip_size
 from risk.execution_costs import configured_execution_cost_usd
 from core.validator import DecisionValidator
-from core.evidence import build_evidence_ids, has_directional_trigger
+from llm.client import DeterministicDecisionProvider
+from core.evidence import (
+    build_evidence_ids,
+    has_directional_trigger,
+    permitted_entry_actions,
+)
 from database.replay_logger import TradeReplayLogger
 from app_config.paths import DEFAULT_DB_PATH
 from database.reconciliation import BrokerHistoryReconciler
@@ -104,6 +110,10 @@ class TradingEngine:
         self._protection_state_healthy: bool = True
         self.last_scan_times: Dict[str, datetime] = {}
         self.last_bar_times: Dict[str, str] = {}
+        # Ranking can refresh while symbols from the same M5 close are still
+        # being evaluated. Keep an immutable per-bar admission record so a
+        # refreshed top-three cannot enqueue a fourth late model request.
+        self._entry_model_admissions: Dict[str, set[str]] = {}
         self._previous_trend_states: Dict[str, Dict[str, str]] = {}
         self._last_stale_bars: Dict[str, str] = {}
         initial_candidates = self._market_candidates_for_current_market()
@@ -126,6 +136,9 @@ class TradingEngine:
         }
         self._last_positions_tickets: List[int] = []
         self._last_position_bot_owned: Dict[int, bool] = {}
+        # MT5 labels application-submitted closes as EXPERT. Keep the exact
+        # strategy cause until broker history confirms the position is gone.
+        self._pending_close_reasons: Dict[int, str] = {}
         self._peak_profits: Dict[int, float] = {}
         self._peak_profit_usd: Dict[int, float] = {}
         self._trough_profits: Dict[int, float] = {}
@@ -133,8 +146,8 @@ class TradingEngine:
         self._peak_state_loaded: set[int] = set()
         self._peak_persisted_usd: Dict[int, float] = {}
         self._trough_persisted_usd: Dict[int, float] = {}
-        self._early_profit_lock_tickets: set[int] = set()
         self._profit_lock_tickets: set[int] = set()
+        self._profit_lock_levels: Dict[int, float] = {}
         self._breakeven_tickets: set[int] = set()
         self._protection_failures: Dict[Tuple[int, str], Tuple[str, float]] = {}
         self._initial_risk_pips: Dict[int, float] = {}
@@ -143,6 +156,7 @@ class TradingEngine:
         self._baseline_error_tickets: set[int] = set()
         self._last_reconcile_monotonic: float = 0.0
         self._last_tick_error_log_monotonic: float = 0.0
+        self._symbol_point_cache: Dict[str, float] = {}
         self._last_positions_error_log_monotonic: float = 0.0
         self._position_state_healthy: bool = True
         self._position_risk_healthy: bool = True
@@ -386,14 +400,22 @@ class TradingEngine:
             analysis.get("indicators", {}).get("candle_return_atr", 0.0) or 0.0
         )
         annotate_range_reversion(analysis)
+        entry_actions = permitted_entry_actions(
+            build_evidence_ids({"M5": analysis})
+        )
+        capital_fit["actionable_entry_evidence"] = bool(entry_actions)
+        capital_fit["permitted_entry_actions"] = list(entry_actions)
         prefilter_reason = self._entry_prefilter_reason(
-            analysis, allow_pending_range=True
+            analysis,
+            allow_pending_range=True,
+            allow_provisional_aligned_decline=True,
         )
         capital_fit["entry_prefilter_reason"] = prefilter_reason
         capital_fit["model_eligible"] = bool(
             capital_fit.get("capital_fit")
             and capital_fit.get("broker_open", True)
             and not prefilter_reason
+            and entry_actions
         )
         capital_fit.update(AdaptiveMarketSelector.score(symbol, analysis, capital_fit))
         dashboard_state.update_market_fit(symbol, capital_fit)
@@ -913,8 +935,11 @@ class TradingEngine:
     @staticmethod
     def _entry_prefilter_reason(
         m5_analysis: Dict[str, Any],
+        m15_analysis: Optional[Dict[str, Any]] = None,
+        h1_analysis: Optional[Dict[str, Any]] = None,
         *,
         allow_pending_range: bool = False,
+        allow_provisional_aligned_decline: bool = False,
     ) -> str:
         """Skip model work when deterministic entry gates cannot pass."""
         indicators = (m5_analysis or {}).get("indicators", {})
@@ -935,7 +960,7 @@ class TradingEngine:
         if adx < settings.entry_min_adx and not range_can_continue:
             return (
                 "REJECTED [ADX Prefilter]: Weak ranging market "
-                f"(ADX {adx:.1f} < {settings.entry_min_adx:.1f}). "
+                f"(ADX {adx:.2f} < {settings.entry_min_adx:.2f}). "
                 "Model inference skipped because an entry cannot pass risk."
             )
         if settings.entry_require_adx_rising and not range_can_continue:
@@ -945,12 +970,27 @@ class TradingEngine:
                 adx_delta = math.nan
             decline_limit = -settings.entry_adx_decline_tolerance
             if math.isfinite(adx_delta) and adx_delta < decline_limit:
-                return (
-                    "REJECTED [ADX Prefilter]: M5 ADX is falling "
-                    f"({adx_delta:+.2f}); allowed noise is "
-                    f"{settings.entry_adx_decline_tolerance:.2f}. Model "
-                    "inference skipped until momentum stabilizes."
+                aligned_exception = aligned_structure_allows_adx_decline(
+                    m5_analysis,
+                    m15_analysis,
+                    h1_analysis,
+                    max_decline=(
+                        settings.entry_aligned_adx_decline_tolerance
+                    ),
+                    min_m5_adx=settings.breakout_min_adx,
+                    min_m15_adx=settings.confirmation_min_adx,
+                    require_confirmation_alignment=(
+                        not allow_provisional_aligned_decline
+                    ),
                 )
+                if not aligned_exception:
+                    return (
+                        "REJECTED [ADX Prefilter]: M5 ADX is falling "
+                        f"({adx_delta:+.2f}); allowed noise is "
+                        f"{settings.entry_adx_decline_tolerance:.2f}. A "
+                        "bounded exception requires fresh M5 structure with "
+                        "strong, aligned M15/H1 confirmation."
+                    )
         return ""
 
     @staticmethod
@@ -965,6 +1005,39 @@ class TradingEngine:
                 f"Decision age {age:.1f}s exceeds the {limit:.1f}s "
                 "entry deadline",
             )
+        return True, ""
+
+    def _reserve_entry_model_slot(
+        self,
+        symbol: str,
+        completed_bar: str,
+    ) -> Tuple[bool, str]:
+        """Reserve one bounded local-model request for a completed M5 bar."""
+        bar_key = str(completed_bar or "UNKNOWN")
+        normalized_symbol = str(symbol or "").upper()
+        admissions = self._entry_model_admissions.setdefault(bar_key, set())
+        if normalized_symbol in admissions:
+            return True, ""
+
+        limit = max(1, int(settings.llm_entry_candidates_per_bar))
+        if len(admissions) >= limit:
+            admitted = ", ".join(sorted(admissions)) or "none"
+            return False, (
+                "Deterministic scan completed, but the bounded local-model "
+                f"lane already admitted {limit} candidate"
+                f"{'s' if limit != 1 else ''} for this M5 close "
+                f"({admitted}). Waiting for the next completed candle avoids "
+                "a late queued decision."
+            )
+
+        admissions.add(normalized_symbol)
+        # Retain a small idempotency window for retries without growing state
+        # throughout an unattended session.
+        while len(self._entry_model_admissions) > 8:
+            oldest = next(iter(self._entry_model_admissions))
+            if oldest == bar_key:
+                break
+            self._entry_model_admissions.pop(oldest, None)
         return True, ""
 
     @staticmethod
@@ -990,6 +1063,76 @@ class TradingEngine:
             - elapsed
         )
         return max(0.0, min(decision_remaining, bar_remaining))
+
+    @staticmethod
+    def _deterministic_entry_fast_path(
+        decision_context: Dict[str, Any],
+        entry_contract: Tuple[str, ...],
+    ) -> Optional[Dict[str, Any]]:
+        """Return a bounded no-network decision for an unambiguous setup.
+
+        This is intentionally a strict subset of the normal entry flow. It is
+        available only when completed-M5 evidence permits exactly one action,
+        M5/M15/H1/H4 all point in that direction, and a directional M5
+        structure trigger exists. The result does not place an order directly;
+        it continues through every existing validation and risk gate.
+        """
+        if (
+            not settings.deterministic_entry_fast_path_enabled
+            or decision_context.get("has_open_position")
+            or len(entry_contract) != 1
+        ):
+            return None
+
+        action = str(entry_contract[0]).upper()
+        expected = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(action)
+        if expected is None:
+            return None
+
+        analyses = decision_context.get("analyses") or {}
+        if not all(
+            analyses.get(timeframe)
+            for timeframe in ("M5", "M15", "H1", "H4")
+        ):
+            return None
+        evidence_ids = build_evidence_ids(analyses)
+        if not has_directional_trigger(
+            evidence_ids,
+            action,
+            timeframes=("M5",),
+        ):
+            return None
+
+        def direction(timeframe: str) -> str:
+            structure = analyses[timeframe].get("market_structure") or {}
+            value = (
+                structure.get("trend_state_direction")
+                or structure.get("trend")
+            )
+            return str(value or "NEUTRAL").upper()
+
+        if any(
+            direction(timeframe) != expected
+            for timeframe in ("M5", "M15", "H1", "H4")
+        ):
+            return None
+
+        decision = DeterministicDecisionProvider._decide(decision_context)
+        if str(decision.get("action", "HOLD")).upper() != action:
+            return None
+        try:
+            confidence = float(decision.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(confidence)
+            or confidence < settings.confidence_threshold
+        ):
+            return None
+
+        result = dict(decision)
+        result["_decision_path"] = "DETERMINISTIC_FAST_PATH"
+        return result
 
     def _defer_disarmed_signal(self, symbol: str) -> None:
         if not hasattr(self, "_signals_waiting_for_rearm"):
@@ -1029,7 +1172,7 @@ class TradingEngine:
             entries_armed=False,
             safety_status="PAPER" if settings.dry_run else "LOCKED",
             safety_reason=reason,
-            scan_status=f"ENGINE ERROR Â· {name.upper()} LOOP",
+            scan_status=f"ENGINE ERROR · {name.upper()} LOOP",
         )
         for analysis_task in list(self.analysis_tasks.values()):
             analysis_task.cancel()
@@ -1061,7 +1204,7 @@ class TradingEngine:
                 entries_armed=False,
                 safety_status="PAPER" if settings.dry_run else "LOCKED",
                 safety_reason=reason,
-                scan_status=f"ENGINE ERROR Â· {name.upper()} LOOP",
+                scan_status=f"ENGINE ERROR · {name.upper()} LOOP",
             )
             self._update_execution_readiness(
                 None, override=("ENGINE_LOOP_FAILED", reason)
@@ -1252,11 +1395,11 @@ class TradingEngine:
             "_trough_persisted_usd",
             "_initial_risk_pips",
             "_adverse_momentum_streaks",
+            "_profit_lock_levels",
         ):
             getattr(self, name, {}).pop(ticket, None)
         for name in (
             "_peak_state_loaded",
-            "_early_profit_lock_tickets",
             "_profit_lock_tickets",
             "_breakeven_tickets",
             "_baseline_error_tickets",
@@ -1503,6 +1646,7 @@ class TradingEngine:
         self.entries_armed = False
         self._armed_account_identity = None
         self._failure_task = None
+        getattr(self, "_entry_model_admissions", {}).clear()
         self.executor.resume()
         dashboard_state.update_automation(
             entries_armed=False,
@@ -2074,9 +2218,7 @@ class TradingEngine:
         if not persisted:
             return False, "Could not persist the UTC daily-loss reset"
         self.risk.reset_daily_loss_for_today(marker)
-        for symbol, decision in dashboard_state.to_dict().get(
-            "symbol_decisions", {}
-        ).items():
+        for symbol, decision in dashboard_state.symbol_decisions_snapshot().items():
             if "Loss Cooldown]" in str(decision.get("gate_reason", "")):
                 dashboard_state.update_symbol_decision(
                     symbol,
@@ -2114,9 +2256,7 @@ class TradingEngine:
         if not persisted:
             return False, "Could not persist the loss-cooldown reset"
         self.risk.reset_loss_cooldown(marker)
-        for symbol, decision in dashboard_state.to_dict().get(
-            "symbol_decisions", {}
-        ).items():
+        for symbol, decision in dashboard_state.symbol_decisions_snapshot().items():
             if "Loss Cooldown]" not in str(decision.get("gate_reason", "")):
                 continue
             manual_available = bool(decision.get("manual_override_available", False))
@@ -2158,9 +2298,7 @@ class TradingEngine:
         if not persisted:
             return False, "Could not persist the losing-streak reset"
         self.risk.reset_losing_streak(marker)
-        for symbol, decision in dashboard_state.to_dict().get(
-            "symbol_decisions", {}
-        ).items():
+        for symbol, decision in dashboard_state.symbol_decisions_snapshot().items():
             if "[Losing Streak Pause]" not in str(decision.get("gate_reason", "")):
                 continue
             manual_available = bool(decision.get("manual_override_available", False))
@@ -2522,6 +2660,8 @@ class TradingEngine:
                 )
             if not result.success:
                 return False, result.error or "Close failed"
+            if percent >= 99.999 and int(position.magic) == settings.strategy_magic:
+                self._pending_close_reasons[int(ticket)] = "OPERATOR_CLOSE"
             self.log(f"Operator close verified for ticket {ticket} ({percent:.0f}%).")
             return True, "Close verified"
 
@@ -2743,6 +2883,7 @@ class TradingEngine:
         if self.analysis_tasks:
             await asyncio.gather(*self.analysis_tasks.values(), return_exceptions=True)
         self.analysis_tasks.clear()
+        getattr(self, "_entry_model_admissions", {}).clear()
         if getattr(self, "position_exit_tasks", {}):
             await asyncio.gather(
                 *self.position_exit_tasks.values(), return_exceptions=True
@@ -2984,6 +3125,7 @@ class TradingEngine:
                     # positions closing on the newly selected account.
                     self._last_positions_tickets.clear()
                     self._last_position_bot_owned.clear()
+                    self._pending_close_reasons.clear()
                     self._peak_profits.clear()
                     self._peak_profit_usd.clear()
                     self._trough_profits.clear()
@@ -2991,14 +3133,15 @@ class TradingEngine:
                     self._peak_state_loaded.clear()
                     self._peak_persisted_usd.clear()
                     self._trough_persisted_usd.clear()
-                    self._early_profit_lock_tickets.clear()
                     self._profit_lock_tickets.clear()
+                    self._profit_lock_levels.clear()
                     self._breakeven_tickets.clear()
                     self._protection_failures.clear()
                     self._initial_risk_pips.clear()
                     self._baseline_error_tickets.clear()
                     self.last_scan_times.clear()
                     self.last_bar_times.clear()
+                    self._entry_model_admissions.clear()
                     self.last_exit_bar_times.clear()
                     self._previous_trend_states.clear()
                     self._last_stale_bars.clear()
@@ -3016,6 +3159,7 @@ class TradingEngine:
                     self._last_market_selection_monotonic = 0.0
                     self._market_rankings.clear()
                     self._forex_context_by_symbol.clear()
+                    self._symbol_point_cache.clear()
                     self._selected_symbols = tuple(
                         self._market_candidates_for_current_market()[
                             : settings.dynamic_market_max_symbols
@@ -3167,8 +3311,7 @@ class TradingEngine:
                             # This reflects a broker-verified modification, not
                             # merely a threshold crossing.
                             "profit_lock_armed": (
-                                int(p.ticket) in self._early_profit_lock_tickets
-                                or int(p.ticket) in self._profit_lock_tickets
+                                int(p.ticket) in self._profit_lock_tickets
                             ),
                             "initial_risk_pips": initial_risk_pips,
                             "duration_min": duration_min,
@@ -3226,7 +3369,14 @@ class TradingEngine:
                                 f"Strategy position ticket {ticket} closed. "
                                 f"Realized Profit: ${profit_usd:.2f}"
                             )
-                            await self._update_replay_outcome(ticket, profit_usd)
+                            close_reason = self._pending_close_reasons.pop(
+                                int(ticket), ""
+                            )
+                            await self._update_replay_outcome(
+                                ticket,
+                                profit_usd,
+                                close_reason=close_reason,
+                            )
                             self.risk.record_trade_closed(
                                 profit_usd,
                                 float(account.get("balance", 0.0)),
@@ -3500,15 +3650,31 @@ class TradingEngine:
                 # expensive analysis/model decisions and possible execution.
                 symbols_to_scan = self._market_candidates_for_current_market()
 
+                point_cache = getattr(self, "_symbol_point_cache", None)
+                if point_cache is None:
+                    point_cache = {}
+                    self._symbol_point_cache = point_cache
                 for symbol in symbols_to_scan:
-                    tick = await self.reader.get_live_tick(symbol)
+                    tick = await self.reader.get_live_tick(
+                        symbol, assume_connected=True
+                    )
                     if tick:
                         key = symbol
                         last_t = last_ticks.get(key)
                         if last_t != tick["time_msc"]:
                             last_ticks[key] = tick["time_msc"]
-                            symbol_info = await asyncio.to_thread(mt5.symbol_info, symbol)
-                            point = symbol_info.point if symbol_info else 0.00001
+                            point = point_cache.get(symbol.upper())
+                            if point is None:
+                                symbol_info = await asyncio.to_thread(
+                                    mt5.symbol_info, symbol
+                                )
+                                point = (
+                                    float(symbol_info.point)
+                                    if symbol_info
+                                    and float(symbol_info.point) > 0
+                                    else 0.00001
+                                )
+                                point_cache[symbol.upper()] = point
                             
                             # Retrieve trend from current dashboard state instead of recalculating
                             existing_price = dashboard_state.prices.get(symbol)
@@ -3923,6 +4089,9 @@ class TradingEngine:
                         expected_account=self._account_identity(fresh_account),
                     )
                     if result.success:
+                        self._pending_close_reasons[ticket] = (
+                            f"DETERMINISTIC_{timeframe.upper()}_REVERSAL"
+                        )
                         self.log(
                             f"Deterministic {timeframe} reversal exit closed "
                             f"ticket {ticket} ({symbol}): {reversal_reason}"
@@ -3953,6 +4122,25 @@ class TradingEngine:
                                 or "Deterministic reversal exit failed"
                             ),
                         )
+            return
+
+        if not settings.exit_model_confirmation_enabled:
+            dashboard_state.update_symbol_decision(
+                symbol,
+                stage=f"MONITORING {timeframe}",
+                action="HOLD",
+                confidence=0.0,
+                reasoning=(
+                    "No deterministic adverse reversal is confirmed on the "
+                    f"completed {timeframe}/M5 evidence."
+                ),
+                trade_management=(
+                    "Broker SL/TP, adaptive profit floor, break-even, trailing, "
+                    "and deterministic reversal protection remain active."
+                ),
+                candle_time=completed_exit_bar,
+                gate_reason="",
+            )
             return
 
         decision_context = {
@@ -4168,6 +4356,9 @@ class TradingEngine:
                 expected_account=self._account_identity(fresh_account),
             )
         if result.success:
+            self._pending_close_reasons[ticket] = (
+                f"FAST_{timeframe.upper()}_MODEL_EXIT"
+            )
             self.log(
                 f"Fast {timeframe} exit closed ticket {ticket} ({symbol}): "
                 f"{reasoning}"
@@ -4444,8 +4635,35 @@ class TradingEngine:
             )
             self._set_symbol_scan_state(symbol, "COMPLETE")
             return
+
+        decision_analyses = {
+            "M5": m5_analysis,
+            "M15": m15_analysis,
+            "H1": h1_analysis,
+            "H4": h4_analysis,
+        }
+        allowed_evidence_ids = build_evidence_ids(decision_analyses)
+        entry_contract = permitted_entry_actions(allowed_evidence_ids)
+        decision_context = {
+            "symbol": symbol,
+            "completed_bar": completed_bar,
+            "has_open_position": has_open_position,
+            "open_positions": symbol_positions,
+            "previous_trend_states": previous_trend_states,
+            "market": capital_fit,
+            "live_tick": tick or {},
+            "forex_context": dict(
+                self._forex_context_by_symbol.get(symbol.upper(), {})
+            ),
+            "analyses": {**decision_analyses},
+        }
+        fast_path_decision: Optional[Dict[str, Any]] = None
         if not has_open_position:
-            prefilter_reason = self._entry_prefilter_reason(m5_analysis)
+            prefilter_reason = self._entry_prefilter_reason(
+                m5_analysis,
+                m15_analysis,
+                h1_analysis,
+            )
             if prefilter_reason:
                 self.last_bar_times[symbol] = completed_bar
                 dashboard_state.update_symbol_decision(
@@ -4466,24 +4684,17 @@ class TradingEngine:
                     ),
                 )
                 return
-            model_rank = capital_fit.get("model_selection_rank")
-            if (
-                settings.dynamic_market_selection_enabled
-                and self._market_selection_initialized
-                and isinstance(model_rank, int)
-                and model_rank > settings.llm_entry_candidates_per_bar
-            ):
+            if not entry_contract:
                 self.last_bar_times[symbol] = completed_bar
                 reason = (
-                    "Deterministic scan completed, but this setup ranks "
-                    f"#{model_rank} outside the top "
-                    f"{settings.llm_entry_candidates_per_bar} model candidates "
-                    "for this candle. The local-model lane is reserved for the "
-                    "strongest fresh setups."
+                    "No actionable completed-M5 BOS, confirmed CHoCH, "
+                    "breakout, verified retest, or eligible range setup is "
+                    "available. The local-model lane remains free for markets "
+                    "that can produce a valid BUY or SELL decision."
                 )
                 dashboard_state.update_symbol_decision(
                     symbol,
-                    stage="RANKED STANDBY",
+                    stage="NO ENTRY EVIDENCE",
                     action="HOLD",
                     confidence=0.0,
                     reasoning=reason,
@@ -4494,11 +4705,76 @@ class TradingEngine:
                 self._set_symbol_scan_state(
                     symbol,
                     "COMPLETE",
-                    last_scan=f"{datetime.now().strftime('%H:%M:%S')} / {symbol}",
+                    last_scan=(
+                        f"{datetime.now().strftime('%H:%M:%S')} / {symbol}"
+                    ),
                 )
                 return
+            fast_path_decision = self._deterministic_entry_fast_path(
+                decision_context,
+                entry_contract,
+            )
+            if fast_path_decision is None:
+                model_rank = capital_fit.get("model_selection_rank")
+                if (
+                    settings.dynamic_market_selection_enabled
+                    and self._market_selection_initialized
+                    and isinstance(model_rank, int)
+                    and model_rank > settings.llm_entry_candidates_per_bar
+                ):
+                    self.last_bar_times[symbol] = completed_bar
+                    reason = (
+                        "Deterministic scan completed, but this setup ranks "
+                        f"#{model_rank} outside the top "
+                        f"{settings.llm_entry_candidates_per_bar} model candidates "
+                        "for this candle. The local-model lane is reserved for the "
+                        "strongest fresh setups."
+                    )
+                    dashboard_state.update_symbol_decision(
+                        symbol,
+                        stage="RANKED STANDBY",
+                        action="HOLD",
+                        confidence=0.0,
+                        reasoning=reason,
+                        inference_time_s=0.0,
+                        gate_reason=reason,
+                        candle_time=completed_bar,
+                    )
+                    self._set_symbol_scan_state(
+                        symbol,
+                        "COMPLETE",
+                        last_scan=(
+                            f"{datetime.now().strftime('%H:%M:%S')} / {symbol}"
+                        ),
+                    )
+                    return
+                admitted, admission_reason = self._reserve_entry_model_slot(
+                    symbol,
+                    completed_bar,
+                )
+                if not admitted:
+                    self.last_bar_times[symbol] = completed_bar
+                    dashboard_state.update_symbol_decision(
+                        symbol,
+                        stage="RANKED STANDBY",
+                        action="HOLD",
+                        confidence=0.0,
+                        reasoning=admission_reason,
+                        inference_time_s=0.0,
+                        gate_reason=admission_reason,
+                        candle_time=completed_bar,
+                    )
+                    self._set_symbol_scan_state(
+                        symbol,
+                        "COMPLETE",
+                        last_scan=(
+                            f"{datetime.now().strftime('%H:%M:%S')} / {symbol}"
+                        ),
+                    )
+                    return
         if (
-            hasattr(self.llm, "readiness_probe")
+            fast_path_decision is None
+            and hasattr(self.llm, "readiness_probe")
             and not self._decision_provider_inference_ready
         ):
             dashboard_state.update_symbol_decision(
@@ -4520,25 +4796,10 @@ class TradingEngine:
             limit=20,
             account_login=self._active_account_login,
         )
-        decision_context = {
-            "symbol": symbol,
-            "completed_bar": completed_bar,
-            "has_open_position": has_open_position,
-            "open_positions": symbol_positions,
-            "previous_trend_states": previous_trend_states,
-            "market": capital_fit,
-            "live_tick": tick or {},
-            "forex_context": dict(
-                self._forex_context_by_symbol.get(symbol.upper(), {})
-            ),
-            "analyses": {
-                "M5": m5_analysis,
-                "M15": m15_analysis,
-                "H1": h1_analysis,
-                "H4": h4_analysis,
-            },
-        }
-        if getattr(self.llm, "provider_name", "") == "deterministic":
+        if fast_path_decision is not None:
+            system_prompt = "deterministic-entry-fast-path-v1"
+            user_prompt = f"{symbol} completed M5 bar {completed_bar}"
+        elif getattr(self.llm, "provider_name", "") == "deterministic":
             # The rules provider consumes the structured context directly. Do
             # not spend time rendering a model prompt or include account data.
             system_prompt = "deterministic-rules-v2-adaptive"
@@ -4560,14 +4821,26 @@ class TradingEngine:
                 forex_context=decision_context["forex_context"],
             )
 
-        self.log(
-            f"Querying {settings.llm_provider.upper()} decision service for {symbol}..."
-        )
-        self._set_symbol_scan_state(symbol, "LLM_INFERENCE")
-        dashboard_state.update_symbol_decision(
-            symbol, stage="LLM INFERENCE", candle_time=completed_bar
-        )
-        logger.debug("Prepared bounded decision prompt for %s", symbol)
+        if fast_path_decision is not None:
+            self.log(
+                f"Using deterministic entry fast path for {symbol}; "
+                "all normal execution gates remain active."
+            )
+            self._set_symbol_scan_state(symbol, "FAST_PATH")
+            dashboard_state.update_symbol_decision(
+                symbol,
+                stage="FAST PATH",
+                candle_time=completed_bar,
+            )
+        else:
+            self.log(
+                f"Querying {settings.llm_provider.upper()} decision service for {symbol}..."
+            )
+            self._set_symbol_scan_state(symbol, "LLM_INFERENCE")
+            dashboard_state.update_symbol_decision(
+                symbol, stage="LLM INFERENCE", candle_time=completed_bar
+            )
+            logger.debug("Prepared bounded decision prompt for %s", symbol)
         start_time = asyncio.get_event_loop().time()
         telemetry: Dict[str, Any]
 
@@ -4600,7 +4873,19 @@ class TradingEngine:
                 ) // 4,
             }
 
-        if has_open_position:
+        used_fast_path = fast_path_decision is not None
+        if used_fast_path:
+            decision = fast_path_decision
+            telemetry = {
+                "trace_id": uuid.uuid4().hex,
+                "provider": "deterministic-fast-path",
+                "model": "rules-v2-adaptive",
+                "latency_seconds": 0.0,
+                "success": True,
+                "error": "",
+                "prompt_tokens_estimate": 0,
+            }
+        elif has_open_position:
             # Managed-position reviews are not entry requests and remain
             # exempt from the completed-M5 entry deadline.
             async with self._decision_semaphore:
@@ -4652,9 +4937,10 @@ class TradingEngine:
                 return
         elapsed = asyncio.get_event_loop().time() - start_time
         inference_latency = self._reported_inference_latency(telemetry, elapsed)
-        self._record_decision_provider_result(
-            bool(telemetry.get("success"))
-        )
+        if not used_fast_path:
+            self._record_decision_provider_result(
+                bool(telemetry.get("success"))
+            )
         queue_delay = max(0.0, elapsed - inference_latency)
         if queue_delay >= 1.0:
             logger.debug(
@@ -4663,7 +4949,6 @@ class TradingEngine:
                 queue_delay,
                 inference_latency,
             )
-        allowed_evidence_ids = build_evidence_ids(decision_context["analyses"])
         close_position_side = None
         if symbol_positions:
             close_position_side = (
@@ -4673,6 +4958,7 @@ class TradingEngine:
             decision,
             allowed_evidence_ids=allowed_evidence_ids,
             close_position_side=close_position_side,
+            permitted_actions=entry_contract,
         )
         if telemetry.get("trace_id"):
             await asyncio.to_thread(
@@ -4721,11 +5007,21 @@ class TradingEngine:
             decision_context.get("forex_context", {})
         )
         self.last_bar_times[symbol] = completed_bar
-        dashboard_state.update_automation(
-            llm_online=True,
-            decision_provider_inference_ready=True,
-            model=str(telemetry.get("model") or settings.decision_model),
-        )
+        automation_update = {
+            # A per-symbol fast-path result should not relabel the configured
+            # provider in the global readiness header.
+            "model": (
+                settings.decision_model
+                if used_fast_path
+                else str(telemetry.get("model") or settings.decision_model)
+            ),
+        }
+        if not used_fast_path:
+            automation_update.update(
+                llm_online=True,
+                decision_provider_inference_ready=True,
+            )
+        dashboard_state.update_automation(**automation_update)
         self._set_symbol_scan_state(
             symbol,
             "COMPLETE",
@@ -4858,6 +5154,7 @@ class TradingEngine:
                     ticket, expected_account=self._account_identity(fresh_account)
                 )
             if res.success:
+                self._pending_close_reasons[ticket] = "MODEL_EXIT"
                 self.log(f"Successfully closed position ticket {ticket}.")
                 await self.db.log_trade({
                     "ticket": ticket,
@@ -4929,24 +5226,50 @@ class TradingEngine:
             )
             return
         if confidence < settings.confidence_threshold:
-            reason = (
-                f"Confidence {confidence:.0%} is below the "
-                f"{settings.confidence_threshold:.0%} entry gate"
+            reversal_qualified, reversal_detail = (
+                self.risk.qualify_failed_thesis_reversal(
+                    action,
+                    confidence,
+                    history,
+                    m5_analysis,
+                    m15_analysis,
+                )
             )
-            dashboard_state.update_symbol_decision(
-                symbol, stage="BELOW CONFIDENCE", gate_reason=reason
-            )
-            if manual_candidate:
-                self._offer_manual_trade_candidate(symbol, manual_candidate, reason)
-            await self._record_shadow_candidate(
-                symbol=symbol,
-                action=action,
-                completed_bar=completed_bar,
-                plan=plan,
-                stage="BELOW CONFIDENCE",
-                reason=reason,
-            )
-            return
+            if reversal_qualified:
+                decision["_strategy"] = {
+                    "mode": "FAILED_THESIS_REVERSAL",
+                    "source": "DETERMINISTIC_FAILED_THESIS_REVERSAL",
+                    "detail": reversal_detail,
+                }
+                if manual_candidate:
+                    manual_candidate["decision"] = dict(decision)
+                self.log(
+                    f"Bounded failed-thesis reversal qualified for {symbol}: "
+                    f"{reversal_detail}. Continuing through all normal risk gates."
+                )
+            else:
+                reason = (
+                    f"Confidence {confidence:.0%} is below the "
+                    f"{settings.confidence_threshold:.0%} entry gate; bounded "
+                    f"reversal exception not met ({reversal_detail})"
+                )
+                dashboard_state.update_symbol_decision(
+                    symbol, stage="BELOW CONFIDENCE", gate_reason=reason
+                )
+                self.log(f"Entry rejected for {symbol}: {reason}", "WARNING")
+                if manual_candidate:
+                    self._offer_manual_trade_candidate(
+                        symbol, manual_candidate, reason
+                    )
+                await self._record_shadow_candidate(
+                    symbol=symbol,
+                    action=action,
+                    completed_bar=completed_bar,
+                    plan=plan,
+                    stage="BELOW CONFIDENCE",
+                    reason=reason,
+                )
+                return
         if not plan or not plan.valid:
             reason = plan.reason if plan else "Deterministic order plan is unavailable"
             dashboard_state.update_symbol_decision(
@@ -5051,8 +5374,26 @@ class TradingEngine:
                 )
                 return
 
+            # Fetch one broker snapshot and use it for both planning and risk.
+            # Previously the planner and risk manager fetched independent
+            # quotes, which added latency and could display/approve levels from
+            # slightly different ticks during a fast move.
+            symbol_info = await asyncio.to_thread(mt5.symbol_info, symbol)
+            final_tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
+            if symbol_info is None or final_tick is None:
+                dashboard_state.update_symbol_decision(
+                    symbol,
+                    stage="REJECTED",
+                    gate_reason="Final broker quote is unavailable",
+                )
+                return
             final_plan = await asyncio.to_thread(
-                DeterministicTradePlanner.build, symbol, action, m5_analysis
+                DeterministicTradePlanner.build,
+                symbol,
+                action,
+                m5_analysis,
+                info=symbol_info,
+                tick=final_tick,
             )
             if not final_plan.valid:
                 dashboard_state.update_symbol_decision(
@@ -5084,13 +5425,6 @@ class TradingEngine:
                             self.contract_size = contract_size
                             self.spread = spread
                     self.metrics = Metrics(bid, ask, point, contract_size, spread)
-            symbol_info = await asyncio.to_thread(mt5.symbol_info, symbol)
-            final_tick = await asyncio.to_thread(mt5.symbol_info_tick, symbol)
-            if symbol_info is None or final_tick is None:
-                dashboard_state.update_symbol_decision(
-                    symbol, stage="REJECTED", gate_reason="Final broker quote is unavailable"
-                )
-                return
             risk_snap = RiskSnapshot(
                 final_tick.bid,
                 final_tick.ask,
@@ -5262,7 +5596,7 @@ class TradingEngine:
                 dashboard_state.update_symbol_decision(
                     symbol,
                     stage=(
-                        "OPENED Â· RISK STATE ERROR" if not baseline_ok
+                        "OPENED · RISK STATE ERROR" if not baseline_ok
                         else "OPENED PARTIAL" if res.partial
                         else "OPENED"
                     ),
@@ -5405,8 +5739,10 @@ class TradingEngine:
         refresh_from_broker: bool = False,
     ) -> None:
         """Applies target profit, target loss, trailing stops and break-even rules to open tickets."""
-        if not hasattr(self, "_early_profit_lock_tickets"):
-            self._early_profit_lock_tickets = set()
+        if not hasattr(self, "_profit_lock_tickets"):
+            self._profit_lock_tickets = set()
+        if not hasattr(self, "_profit_lock_levels"):
+            self._profit_lock_levels = {}
         for candidate in open_positions:
             p = candidate
             if refresh_from_broker:
@@ -5444,7 +5780,11 @@ class TradingEngine:
                 )
                 if res.success:
                     self._forget_position_runtime_state(ticket)
-                    await self._update_replay_outcome(ticket, profit_usd)
+                    await self._update_replay_outcome(
+                        ticket,
+                        profit_usd,
+                        close_reason="TARGET_PROFIT",
+                    )
                     await self.db.log_trade({
                         "ticket": ticket,
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -5476,7 +5816,11 @@ class TradingEngine:
                 )
                 if res.success:
                     self._forget_position_runtime_state(ticket)
-                    await self._update_replay_outcome(ticket, profit_usd)
+                    await self._update_replay_outcome(
+                        ticket,
+                        profit_usd,
+                        close_reason="TARGET_LOSS",
+                    )
                     await self.db.log_trade({
                         "ticket": ticket,
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -5524,7 +5868,9 @@ class TradingEngine:
                 if stagnant_close.success:
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
-                        ticket, estimated_net_profit_usd
+                        ticket,
+                        estimated_net_profit_usd,
+                        close_reason="STAGNATION_EXIT",
                     )
                     await self.db.log_trade({
                         "ticket": ticket,
@@ -5547,91 +5893,7 @@ class TradingEngine:
                     ticket, symbol, "Stagnation close", stagnant_close.error
                 )
 
-            # ── 3. Initial-risk-normalized profit protection ──────────
-            # Preserve headroom while preventing a meaningful early gain from
-            # reverting to the original full-risk stop. This broker-side floor
-            # is evaluated every position poll and does not wait for the model.
-            if (
-                settings.micro_profit_protection_enabled
-                and settings.early_profit_lock_enabled
-                and peak_profit_usd
-                >= settings.early_profit_lock_trigger_usd
-            ):
-                # Fallback close covers a fast gap or broker stop-distance
-                # rejection before the protective stop could be installed.
-                if (
-                    estimated_net_profit_usd
-                    <= settings.early_profit_lock_floor_usd + 1e-9
-                ):
-                    self.log(
-                        f"Early profit fallback triggered for ticket {ticket} "
-                        f"({symbol}): peak ${peak_profit_usd:.2f} retraced to "
-                        f"${profit_usd:.2f} broker / "
-                        f"${estimated_net_profit_usd:.2f} estimated net. "
-                        "Executing exit..."
-                    )
-                    early_close = await self.executor.close_position(
-                        ticket,
-                        expected_account=self._active_account_identity,
-                    )
-                    if early_close.success:
-                        self._forget_position_runtime_state(ticket)
-                        await self._update_replay_outcome(
-                            ticket, estimated_net_profit_usd
-                        )
-                        await self.db.log_trade({
-                            "ticket": ticket,
-                            "time": datetime.now().strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            ),
-                            "symbol": symbol,
-                            "action": "CLOSE",
-                            "lot_size": p.get("volume", 0.0),
-                            "price": (
-                                early_close.price
-                                or p.get("price_current", 0.0)
-                            ),
-                            "sl": p.get("sl", 0.0),
-                            "tp": p.get("tp", 0.0),
-                            "profit": estimated_net_profit_usd,
-                            "reasoning": (
-                                "Early profit floor fallback after "
-                                f"${peak_profit_usd:.2f} peak"
-                            ),
-                            "status": "CLOSED",
-                        })
-                        continue
-                    self._log_protection_failure(
-                        ticket,
-                        symbol,
-                        "Early-profit fallback close",
-                        early_close.error,
-                    )
-                elif ticket not in self._early_profit_lock_tickets:
-                    early_result = await self.executor.lock_minimum_net_profit(
-                        ticket,
-                        floor_usd=settings.early_profit_lock_floor_usd,
-                        expected_account=self._active_account_identity,
-                    )
-                    if (
-                        early_result.success
-                        or "worsen" in str(early_result.error or "").lower()
-                    ):
-                        self._early_profit_lock_tickets.add(ticket)
-                        if early_result.success:
-                            self.log(
-                                f"Early profit floor armed for ticket {ticket} "
-                                f"({symbol}) after persisted peak "
-                                f"${peak_profit_usd:.2f}."
-                            )
-                    else:
-                        self._log_protection_failure(
-                            ticket,
-                            symbol,
-                            "Early-profit floor",
-                            early_result.error,
-                        )
-
+            # ── 3. Persisted-peak profit giveback guard ──────────────
             giveback_level_r = peak_r * (
                 1.0 - settings.profit_giveback_fraction
             )
@@ -5653,8 +5915,23 @@ class TradingEngine:
                     getattr(settings, "profit_giveback_trigger_usd", 0.20)
                 )
             )
+            # A sub-1R winner already has a broker-side profit floor installed
+            # by the lock path below.  Do not also market-close it on an
+            # ordinary giveback: that converted recoverable pullbacks (such as
+            # the observed USDJPY continuation) into premature exits.  Once a
+            # valid-risk trade has reached the mature threshold, the existing
+            # R/USD giveback conditions may close it.  The USD fallback remains
+            # available only when an R baseline could not be reconstructed.
+            giveback_close_mature = (
+                risk_pips <= 0
+                or peak_r
+                >= float(
+                    getattr(settings, "profit_giveback_close_min_r", 1.0)
+                )
+            )
             if (
                 settings.profit_giveback_enabled
+                and giveback_close_mature
                 and (
                     (
                         r_giveback_armed
@@ -5679,7 +5956,9 @@ class TradingEngine:
                 if res.success:
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
-                        ticket, estimated_net_profit_usd
+                        ticket,
+                        estimated_net_profit_usd,
+                        close_reason="PROFIT_GIVEBACK",
                     )
                     await self.db.log_trade({
                         "ticket": ticket,
@@ -5702,55 +5981,25 @@ class TradingEngine:
                     ticket, symbol, "Profit-giveback close", res.error
                 )
 
-            r_profit_lock_ready = (
-                risk_pips > 0
-                and peak_r >= settings.profit_lock_trigger_r
-                and live_r
-                >= peak_r
-                * float(
-                    getattr(settings, "profit_lock_min_live_fraction", 0.75)
-                )
+            # ── 4. Live-profit tiered broker protection ─────────────
+            # The first two tiers require both live net USD and live R. The
+            # final dollar tier deliberately remains available even when an R
+            # baseline cannot be reconstructed. Per-ticket applied levels let
+            # later tiers improve the stop without repeating the same MT5
+            # modification every protection poll.
+            lock_floor_usd, lock_tier = self._profit_lock_target(
+                live_r=live_r,
+                estimated_net_profit_usd=estimated_net_profit_usd,
+                has_r_baseline=risk_pips > 0,
             )
-            usd_profit_lock_ready = (
-                settings.micro_profit_protection_enabled
-                and float(
-                    getattr(settings, "profit_lock_trigger_usd", 0.20)
-                )
-                > 0
-                and peak_profit_usd
-                >= float(
-                    getattr(settings, "profit_lock_trigger_usd", 0.20)
-                )
+
+            applied_floor_usd = float(
+                self._profit_lock_levels.get(ticket, 0.0) or 0.0
             )
             if (
                 settings.profit_lock_enabled
-                and (r_profit_lock_ready or usd_profit_lock_ready)
-                and ticket not in self._profit_lock_tickets
+                and lock_floor_usd > applied_floor_usd + 1e-9
             ):
-                # The R-based lock scales with the trade's actual favorable
-                # excursion.  A fixed $0.03 floor was too loose for positions
-                # that made meaningful progress without reaching the later
-                # break-even/trailing thresholds.  Retain the same fraction
-                # of the cost-adjusted peak that the giveback guard preserves,
-                # while keeping the configured dollar floor as a minimum.
-                # The executor converts this account-currency floor into the
-                # correct broker price and will only improve an existing SL.
-                lock_floor_usd = settings.profit_lock_floor_usd
-                if r_profit_lock_ready:
-                    estimated_cost_usd = max(
-                        0.0, profit_usd - estimated_net_profit_usd
-                    )
-                    peak_net_profit_usd = max(
-                        0.0, peak_profit_usd - estimated_cost_usd
-                    )
-                    retained_peak_fraction = (
-                        1.0 - settings.profit_giveback_fraction
-                    )
-                    lock_floor_usd = max(
-                        lock_floor_usd,
-                        peak_net_profit_usd * retained_peak_fraction,
-                    )
-                    lock_floor_usd = round(lock_floor_usd + 1e-12, 2)
                 result = await self.executor.lock_minimum_net_profit(
                     ticket,
                     floor_usd=lock_floor_usd,
@@ -5758,19 +6007,20 @@ class TradingEngine:
                 )
                 if result.success or "worsen" in str(result.error or "").lower():
                     self._profit_lock_tickets.add(ticket)
+                    self._profit_lock_levels[ticket] = lock_floor_usd
                     if result.success:
                         self.log(
-                            f"Profit floor armed for ticket {ticket} ({symbol}) "
-                            f"after persisted peak +{peak_r:.2f} R / "
-                            f"${peak_profit_usd:.2f}; protected net floor "
-                            f"${lock_floor_usd:.2f}."
+                            f"{lock_tier.capitalize()} profit floor armed for "
+                            f"ticket {ticket} ({symbol}) at {live_r:+.2f} R / "
+                            f"${estimated_net_profit_usd:.2f} estimated net; "
+                            f"protected net floor ${lock_floor_usd:.2f}."
                         )
                 else:
                     self._log_protection_failure(
                         ticket, symbol, "Profit floor", result.error
                     )
 
-            # ── 4. Break-even at a configured R multiple ──────────────
+            # ── 5. Break-even at a configured R multiple ──────────────
             if not hasattr(self, "_breakeven_tickets"):
                 self._breakeven_tickets = set()
             if (
@@ -5795,11 +6045,46 @@ class TradingEngine:
                         "Break-even",
                         breakeven_result.error,
                     )
-            
-            # ── 5. Volatility-normalized trailing stop ────────────────
+
+            # ── 6. Volatility-normalized trailing stop ────────────────
             if risk_pips > 0 and profit_pips >= risk_pips * settings.trailing_trigger_r:
                 await self.executor.apply_trailing_stop(
                     ticket,
                     trail_pips=max(risk_pips * settings.trailing_distance_r, 0.1),
                     expected_account=self._active_account_identity,
                 )
+
+    @staticmethod
+    def _profit_lock_target(
+        *,
+        live_r: float,
+        estimated_net_profit_usd: float,
+        has_r_baseline: bool,
+    ) -> Tuple[float, str]:
+        """Return the strongest currently eligible net-profit floor and tier."""
+        try:
+            net_profit = float(estimated_net_profit_usd)
+            current_r = float(live_r)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0, ""
+        if not math.isfinite(net_profit):
+            return 0.0, ""
+        if net_profit >= settings.profit_lock_final_trigger_usd:
+            return float(settings.profit_lock_final_floor_usd), "final"
+        if not has_r_baseline or not math.isfinite(current_r):
+            return 0.0, ""
+        if (
+            current_r >= settings.profit_lock_mid_trigger_r
+            and net_profit >= settings.profit_lock_mid_trigger_usd
+        ):
+            floor = max(
+                settings.profit_lock_floor_usd,
+                net_profit * settings.profit_lock_mid_fraction,
+            )
+            return round(floor + 1e-12, 2), "35%"
+        if (
+            current_r >= settings.profit_lock_trigger_r
+            and net_profit >= settings.profit_lock_trigger_usd
+        ):
+            return float(settings.profit_lock_floor_usd), "first"
+        return 0.0, ""

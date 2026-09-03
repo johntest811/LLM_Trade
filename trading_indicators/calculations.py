@@ -1,7 +1,6 @@
 import logging
 import pandas as pd
 import ta
-from typing import Optional
 
 logger = logging.getLogger("TradingSystem.Indicators")
 

@@ -84,9 +84,9 @@ def test_replay_logger_deduplicates_and_summarizes_shadow_rows(tmp_path):
         "stop_loss": 1.0990,
         "take_profit": 1.1020,
         "rejection_stage": "RISK REJECTED",
-        "rejection_reason": "test gate",
+        "rejection_reason": "REJECTED [Structure Gate]: test gate",
         "horizon_minutes": 60,
-        "created_at_utc": "2026-08-03T10:00:01Z",
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     first = logger.log_shadow_candidate(**values)
     second = logger.log_shadow_candidate(**values)
@@ -108,3 +108,94 @@ def test_replay_logger_deduplicates_and_summarizes_shadow_rows(tmp_path):
     assert summary["resolved"] == 1
     assert summary["wins"] == 1
     assert summary["expectancy_r"] == 2.0
+    assert summary["gate_breakdown"][0] == {
+        "gate": "Structure Gate",
+        "resolved": 1,
+        "wins": 1,
+        "losses": 0,
+        "expectancy_r": 2.0,
+    }
+
+
+def test_shadow_summary_exposes_symmetric_direction_funnel(tmp_path):
+    logger = TradeReplayLogger(str(tmp_path / "directions.db"))
+    base_decision = {
+        "entry": 1.1000,
+        "stop_loss": 1.0990,
+        "take_profit": 1.1020,
+        "confidence": 0.80,
+    }
+    logger.log_replay_attempt(
+        "EURUSD", "BUY", "", base_decision, {}, {}, 80.0, 70.0,
+        "OPEN", ticket=101,
+    )
+    assert logger.update_replay_outcome(101, 0.50)
+    logger.log_replay_attempt(
+        "GBPUSD", "SELL", "", base_decision, {}, {}, 75.0, 65.0,
+        "REJECTED: REJECTED [Structure Gate]: test",
+    )
+
+    created = datetime.now(timezone.utc).isoformat()
+    buy_shadow = logger.log_shadow_candidate(
+        symbol="AUDUSD",
+        action="BUY",
+        candle_time="2026-08-11T10:00:00Z",
+        entry=1.1000,
+        stop_loss=1.0990,
+        take_profit=1.1020,
+        rejection_stage="RISK REJECTED",
+        rejection_reason="REJECTED [Structure Gate]: buy test",
+        horizon_minutes=60,
+        created_at_utc=created,
+    )
+    sell_shadow = logger.log_shadow_candidate(
+        symbol="USDCHF",
+        action="SELL",
+        candle_time="2026-08-11T10:00:00Z",
+        entry=1.1000,
+        stop_loss=1.1010,
+        take_profit=1.0980,
+        rejection_stage="RISK REJECTED",
+        rejection_reason="REJECTED [Structure Gate]: sell test",
+        horizon_minutes=60,
+        created_at_utc=created,
+    )
+    assert logger.resolve_shadow_candidate(
+        buy_shadow,
+        status="TP",
+        resolved_at_utc="2026-08-11T10:20:00Z",
+        exit_price=1.1020,
+        outcome_r=2.0,
+        mfe_r=2.0,
+        mae_r=0.1,
+    )
+    assert logger.resolve_shadow_candidate(
+        sell_shadow,
+        status="SL",
+        resolved_at_utc="2026-08-11T10:20:00Z",
+        exit_price=1.1010,
+        outcome_r=-1.0,
+        mfe_r=0.2,
+        mae_r=1.0,
+    )
+
+    summary = logger.shadow_summary()
+    directions = {
+        row["action"]: row for row in summary["direction_breakdown"]
+    }
+
+    assert summary["evidence_window_hours"] == 48
+    assert directions["BUY"]["candidates"] == 1
+    assert directions["BUY"]["executed"] == 1
+    assert directions["BUY"]["closed_net_usd"] == 0.50
+    assert directions["BUY"]["shadow_expectancy_r"] == 2.0
+    assert directions["BUY"]["top_rejection_gates"] == [
+        {"gate": "Structure Gate", "count": 1}
+    ]
+    assert directions["SELL"]["candidates"] == 1
+    assert directions["SELL"]["rejected"] == 1
+    assert directions["SELL"]["executed"] == 0
+    assert directions["SELL"]["shadow_expectancy_r"] == -1.0
+    assert directions["SELL"]["top_rejection_gates"] == [
+        {"gate": "Structure Gate", "count": 1}
+    ]

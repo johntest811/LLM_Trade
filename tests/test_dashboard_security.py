@@ -50,7 +50,10 @@ class DashboardSecurityTests(unittest.TestCase):
             save_config({"LOCAL_LLM_REQUIRED_QUANTIZATION": "Q5_K"})
         )
         self.assertEqual(response.status_code, 422)
-        self.assertIn("AUTO, Q6_K, or Q8_0", json.loads(response.body)["error"])
+        self.assertIn(
+            "AUTO, Q4_K_M, Q6_K, or Q8_0",
+            json.loads(response.body)["error"],
+        )
 
     def test_config_persists_147_minimum_risk_reward(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -100,12 +103,12 @@ class DashboardSecurityTests(unittest.TestCase):
             self.assertIn("ENTRY_ADX_DECLINE_TOLERANCE=0.50", saved)
             self.assertIn("PLAN_MAX_COST_TARGET_EXTENSION_R=0.50", saved)
 
-    def test_config_rejects_early_profit_floor_without_headroom(self):
+    def test_config_rejects_first_profit_floor_without_headroom(self):
         response = asyncio.run(
             save_config(
                 {
-                    "EARLY_PROFIT_LOCK_TRIGGER_USD": "0.12",
-                    "EARLY_PROFIT_LOCK_FLOOR_USD": "0.12",
+                    "PROFIT_LOCK_TRIGGER_USD": "0.35",
+                    "PROFIT_LOCK_FLOOR_USD": "0.35",
                 }
             )
         )
@@ -115,6 +118,46 @@ class DashboardSecurityTests(unittest.TestCase):
             "must be lower",
             json.loads(response.body)["error"],
         )
+
+    def test_config_rejects_empty_failed_thesis_confidence_window(self):
+        response = asyncio.run(
+            save_config(
+                {
+                    "CONFIDENCE_THRESHOLD": "0.70",
+                    "FAILED_THESIS_REVERSAL_ENABLED": "true",
+                    "FAILED_THESIS_REVERSAL_MIN_CONFIDENCE": "0.70",
+                }
+            )
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("must be lower", json.loads(response.body)["error"])
+
+    def test_config_rejects_weak_aligned_chase_confidence(self):
+        response = asyncio.run(
+            save_config(
+                {
+                    "CONFIDENCE_THRESHOLD": "0.70",
+                    "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE": "0.69",
+                }
+            )
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("at least", json.loads(response.body)["error"])
+
+    def test_config_rejects_aligned_chase_limit_below_normal_limit(self):
+        response = asyncio.run(
+            save_config(
+                {
+                    "ENTRY_MAX_CANDLE_RANGE_ATR": "1.50",
+                    "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR": "1.49",
+                }
+            )
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("at least", json.loads(response.body)["error"])
 
     def test_config_persists_retest_and_default_off_micro_profit_controls(self):
         with tempfile.TemporaryDirectory() as temp_dir:

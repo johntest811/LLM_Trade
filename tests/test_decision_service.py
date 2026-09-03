@@ -263,11 +263,12 @@ class OpenAIDecisionProviderTests(unittest.IsolatedAsyncioTestCase):
 class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_pins_seed_and_strict_schema(self):
         local_settings = SimpleNamespace(
-            local_llm_model="qwen/qwen3.5-9b",
+            local_llm_model="qwen/qwen3.5-4b",
             local_llm_temperature=0.0,
             local_llm_top_p=0.8,
             local_llm_seed=42,
             local_llm_max_retries=1,
+            local_llm_max_tokens=220,
             local_llm_structured_output=True,
         )
         response = {
@@ -298,7 +299,168 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
         payload = post.call_args.args[0]
         self.assertEqual(payload["seed"], 42)
         self.assertEqual(payload["temperature"], 0.0)
+        self.assertEqual(payload["max_tokens"], 220)
+        self.assertEqual(payload["model"], "qwen/qwen3.5-4b")
+        self.assertEqual(payload["reasoning_effort"], "none")
         self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+
+    async def test_qwen35_4b_catalog_id_resolves_loaded_short_alias(self):
+        api_response = Mock()
+        api_response.raise_for_status.return_value = None
+        api_response.json.return_value = {
+            "models": [
+                {
+                    "key": "qwen3.5-4b",
+                    "quantization": {"name": "Q8_0"},
+                    "loaded_instances": [
+                        {
+                            "id": "qwen3.5-4b",
+                            "config": {
+                                "context_length": 10240,
+                                "parallel": 4,
+                                "flash_attention": True,
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        local_settings = SimpleNamespace(
+            local_llm_model="qwen/qwen3.5-4b",
+            local_llm_url="http://127.0.0.1:1234/v1/chat/completions",
+            local_llm_context_size=4096,
+            local_llm_required_quantization="AUTO",
+            llm_max_concurrency=1,
+        )
+
+        with patch("llm.client.settings", local_settings):
+            provider = LocalDecisionProvider()
+            with patch("llm.client.requests.get", return_value=api_response):
+                result = await provider.health_check()
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["configured_model"], "qwen/qwen3.5-4b")
+        self.assertEqual(result["resolved_model"], "qwen3.5-4b")
+        self.assertEqual(provider.model, "qwen3.5-4b")
+        self.assertTrue(result["context_matches"])
+        self.assertTrue(result["parallel_matches"])
+        self.assertTrue(result["quantization_matches"])
+
+    async def test_bonsai_request_disables_thinking_and_uses_strict_schema(self):
+        local_settings = SimpleNamespace(
+            local_llm_model="prism-ml/bonsai-27b",
+            local_llm_temperature=0.0,
+            local_llm_top_p=0.8,
+            local_llm_seed=42,
+            local_llm_max_retries=1,
+            local_llm_max_tokens=220,
+            local_llm_structured_output=True,
+        )
+        response = {
+            "id": "bonsai-test",
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "action": "HOLD",
+                                "confidence": 0.0,
+                                "ticket_to_close": None,
+                                "evidence_ids": [],
+                                "reasoning": "No entry evidence.",
+                                "trade_management": "Wait.",
+                            }
+                        )
+                    }
+                }
+            ],
+        }
+
+        with patch("llm.client.settings", local_settings):
+            provider = LocalDecisionProvider()
+            with patch.object(provider, "_post", return_value=response) as post:
+                result = await provider.request("system", "user")
+
+        self.assertTrue(result.telemetry.success)
+        payload = post.call_args.args[0]
+        self.assertEqual(payload["model"], "prism-ml/bonsai-27b")
+        self.assertEqual(payload["reasoning_effort"], "none")
+        self.assertEqual(payload["max_tokens"], 220)
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+
+    async def test_bonsai_auto_profile_accepts_its_native_q1(self):
+        api_response = Mock()
+        api_response.raise_for_status.return_value = None
+        api_response.json.return_value = {
+            "models": [
+                {
+                    "key": "prism-ml/bonsai-27b",
+                    "quantization": {"name": "Q1_0"},
+                    "loaded_instances": [
+                        {
+                            "id": "prism-ml/bonsai-27b",
+                            "config": {
+                                "context_length": 10240,
+                                "parallel": 4,
+                                "flash_attention": True,
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        local_settings = SimpleNamespace(
+            local_llm_model="prism-ml/bonsai-27b",
+            local_llm_url="http://127.0.0.1:1234/v1/chat/completions",
+            local_llm_context_size=4096,
+            local_llm_required_quantization="AUTO",
+            llm_max_concurrency=1,
+        )
+
+        with patch("llm.client.settings", local_settings):
+            provider = LocalDecisionProvider()
+            with patch("llm.client.requests.get", return_value=api_response):
+                result = await provider.health_check()
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["resolved_model"], "prism-ml/bonsai-27b")
+        self.assertEqual(result["quantization"], "Q1_0")
+        self.assertTrue(result["quantization_matches"])
+        self.assertIn("Q1_0", result["supported_quantizations"])
+
+    async def test_non_bonsai_auto_profile_still_rejects_q1(self):
+        api_response = Mock()
+        api_response.raise_for_status.return_value = None
+        api_response.json.return_value = {
+            "models": [
+                {
+                    "key": "example/ordinary-model",
+                    "quantization": {"name": "Q1_0"},
+                    "loaded_instances": [
+                        {
+                            "id": "example/ordinary-model",
+                            "config": {"context_length": 4096, "parallel": 1},
+                        }
+                    ],
+                }
+            ]
+        }
+        local_settings = SimpleNamespace(
+            local_llm_model="example/ordinary-model",
+            local_llm_url="http://127.0.0.1:1234/v1/chat/completions",
+            local_llm_context_size=4096,
+            local_llm_required_quantization="AUTO",
+            llm_max_concurrency=1,
+        )
+
+        with patch("llm.client.settings", local_settings):
+            provider = LocalDecisionProvider()
+            with patch("llm.client.requests.get", return_value=api_response):
+                result = await provider.health_check()
+
+        self.assertFalse(result["available"])
+        self.assertFalse(result["quantization_matches"])
+        self.assertNotIn("Q1_0", result["supported_quantizations"])
 
     async def test_native_health_reports_loaded_context_and_quantization(self):
         api_response = Mock()
@@ -438,8 +600,8 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["context_matches"])
         self.assertEqual(result["loaded_context_length"], 10240)
 
-    async def test_native_health_auto_profile_accepts_q6_and_q8(self):
-        for quantization in ("Q6_K", "Q8_0"):
+    async def test_native_health_auto_profile_accepts_supported_variants(self):
+        for quantization in ("Q4_K_M", "Q6_K", "Q8_0"):
             with self.subTest(quantization=quantization):
                 api_response = Mock()
                 api_response.raise_for_status.return_value = None
@@ -483,7 +645,8 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
                     result["quantization_mode"], "FOLLOW_LOADED"
                 )
                 self.assertEqual(
-                    result["supported_quantizations"], ["Q6_K", "Q8_0"]
+                    result["supported_quantizations"],
+                    ["Q4_K_M", "Q6_K", "Q8_0"],
                 )
 
     async def test_native_health_auto_profile_rejects_other_quantization(self):
@@ -493,7 +656,7 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
             "models": [
                 {
                     "key": "qwen/qwen3.5-9b",
-                    "quantization": {"name": "Q4_K_M"},
+                    "quantization": {"name": "Q5_K_M"},
                     "loaded_instances": [
                         {
                             "config": {
@@ -520,7 +683,7 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["available"])
         self.assertFalse(result["quantization_matches"])
-        self.assertIn("supports Q6_K or Q8_0", result["error"])
+        self.assertIn("supports Q4_K_M or Q6_K or Q8_0", result["error"])
 
 
 class LLMClientReadinessTests(unittest.IsolatedAsyncioTestCase):

@@ -60,13 +60,44 @@ class DashboardContractTests(unittest.TestCase):
     def test_entry_noise_and_cost_adjustment_controls_are_present(self):
         for element_id in (
             "c-adx-decline",
+            "c-aligned-adx-decline",
             "c-breakout-displacement",
             "c-cost-extension",
+            "c-model-candidates",
+            "c-unconfirmed-bos-zone",
+            "c-failed-reversal",
+            "c-failed-reversal-confidence",
+            "c-failed-reversal-bars",
+            "c-failed-reversal-m5-adx",
+            "c-failed-reversal-m15-adx",
+            "c-entry-max-extension",
+            "c-aligned-chase-confidence",
+            "c-aligned-chase-extension",
         ):
             self.assertIn(f'id="{element_id}"', self.html)
         self.assertIn("ENTRY_ADX_DECLINE_TOLERANCE", self.js)
+        self.assertIn("ENTRY_ALIGNED_ADX_DECLINE_TOLERANCE", self.js)
         self.assertIn("BREAKOUT_MIN_DISPLACEMENT_ATR", self.js)
         self.assertIn("PLAN_MAX_COST_TARGET_EXTENSION_R", self.js)
+        self.assertIn("LLM_ENTRY_CANDIDATES_PER_BAR", self.js)
+        self.assertIn("ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR", self.js)
+        self.assertIn("FAILED_THESIS_REVERSAL_ENABLED", self.js)
+        self.assertIn("FAILED_THESIS_REVERSAL_MIN_CONFIDENCE", self.js)
+        self.assertIn("ENTRY_MAX_CANDLE_RANGE_ATR", self.js)
+        self.assertIn(
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE", self.js
+        )
+        self.assertIn(
+            "ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR", self.js
+        )
+
+    def test_execution_mode_badge_does_not_label_paper_as_live(self):
+        self.assertIn(
+            'const executionMode = automation.dry_run ? "PAPER" : brokerMode;',
+            self.js,
+        )
+        self.assertIn("modeChip.textContent = executionMode", self.js)
+        self.assertIn("`${executionMode} EXEC", self.js)
 
     def test_retest_and_optional_twenty_cent_controls_are_present(self):
         for element_id in ("c-retest", "c-retest-min", "c-micro-profit"):
@@ -81,13 +112,18 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_model_switch_keeps_single_local_inference_slot(self):
         self.assertIn('const concurrency = 1;', self.js)
-        self.assertIn('LLM_MAX_CONCURRENCY: "1"', self.js)
+        self.assertIn('value="Q4_K_M"', self.html)
+        self.assertNotIn('LLM_MAX_CONCURRENCY: "1"', self.js)
         self.assertNotIn('quantization === "Q6_K" ? 2 : 1', self.js)
 
     def test_shadow_outcome_summary_is_visible(self):
         self.assertIn('id="shadow-summary"', self.html)
+        self.assertIn('id="shadow-gates"', self.html)
+        self.assertIn('id="shadow-directions"', self.html)
+        self.assertIn("direction funnel", self.js)
         self.assertIn("function renderShadowEvidence", self.js)
         self.assertIn("Diagnostic only", self.js)
+        self.assertIn("Last ${windowHours}h gate outcomes", self.js)
 
     def test_live_rendering_is_coalesced_and_heavy_sections_are_cached(self):
         self.assertIn("scheduleDashboardRender", self.js)

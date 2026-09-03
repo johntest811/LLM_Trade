@@ -419,22 +419,23 @@ function renderHeader(state) {
   const account = state.account || {};
   const automation = state.automation || {};
   const readiness = getReadiness(state);
-  const mode = String(account.account_mode || (automation.dry_run ? "PAPER" : "UNKNOWN")).toUpperCase();
+  const brokerMode = String(account.account_mode || "UNKNOWN").toUpperCase();
+  const executionMode = automation.dry_run ? "PAPER" : brokerMode;
   const modeChip = $("account-mode-chip");
-  modeChip.textContent = mode;
-  modeChip.className = `mode-chip ${mode.toLowerCase()}`;
+  modeChip.textContent = executionMode;
+  modeChip.className = `mode-chip ${executionMode.toLowerCase()}`;
   setText("account-identity-text", `${account.broker || "Pepperstone"} · ${account.server || "MT5"} · #${account.account_suffix || "—"}`);
 
   const terminalReady = Boolean(account.terminal_connected);
   const deterministic = String(automation.provider || app.config?.llm_provider || "").toLowerCase() === "deterministic";
-  setStatus("s-account", terminalReady ? "online" : "offline", terminalReady ? `${mode} MT5` : "MT5 OFFLINE");
+  setStatus("s-account", terminalReady ? "online" : "offline", terminalReady ? `${brokerMode} MT5` : "MT5 OFFLINE");
   setStatus(
     "s-llm",
     automation.llm_online ? "online" : "warning",
     automation.llm_online ? (deterministic ? "RULES READY" : "LLM READY") : "DECISION CHECK",
   );
   if (automation.entries_armed) {
-    setStatus("s-lock", readiness.ready ? "ready" : "warning", readiness.ready ? "ARMED · READY" : "ARMED · GATED");
+    setStatus("s-lock", readiness.ready ? "ready" : "warning", readiness.ready ? `ARMED · ${executionMode}` : "ARMED · GATED");
   } else {
     setStatus("s-lock", "neutral", "DISARMED");
   }
@@ -455,12 +456,17 @@ function renderHeader(state) {
     ? `Bound to account ending ${automation.autonomous_account_suffix || "—"} · last health check ${automation.last_health_check || "—"}`
     : "Enable persistent account-bound unattended operation";
 
-  $("live-banner").hidden = mode !== "LIVE" || automation.dry_run;
+  const modelConcurrency = Math.max(1, Math.floor(finite(app.config?.llm_max_concurrency, 1)));
+  const candidates = Math.max(1, Math.floor(finite(app.config?.llm_entry_candidates_per_bar, 3)));
+  setText("runtime-lane", `${modelConcurrency} concurrent · ${candidates} candidates / M5`);
+
+  $("live-banner").hidden = executionMode !== "LIVE";
   setText("payload-sequence", state.sequence ? `Sequence ${state.sequence}` : "Sequence —");
 }
 
 function renderMetrics(state) {
   const account = state.account || {};
+  const automation = state.automation || {};
   const currency = account.currency || "USD";
   const config = app.config || {};
   setText("m-equity", money(account.equity, currency));
@@ -477,7 +483,9 @@ function renderMetrics(state) {
   setText("m-risk-usd", `${money(account.portfolio_risk_usd, currency)} at stops`);
   setText("m-margin", `${finite(account.margin_usage_pct).toFixed(1)}%`);
   setText("m-margin-level", `Margin level ${finite(account.margin_level_pct).toFixed(0)}%`);
-  setText("m-mode", `${account.account_mode || "UNKNOWN"} · 1:${finite(account.leverage)}`);
+  const brokerMode = String(account.account_mode || "UNKNOWN").toUpperCase();
+  const executionMode = automation.dry_run ? "PAPER" : brokerMode;
+  setText("m-mode", `${executionMode} EXEC · ${brokerMode} MT5 · 1:${finite(account.leverage)}`);
 
   const riskCap = Math.max(.01, finite(config.max_portfolio_risk_pct, 3));
   const marginCap = Math.max(.01, finite(config.max_margin_usage_pct, 35));
@@ -1002,6 +1010,12 @@ function renderDecision(state) {
   setText("decision-latency", decision.inference_time_s ? `${finite(decision.inference_time_s).toFixed(2)}s` : "—");
   const model = globalDecision.model || automation.model || app.config?.decision_model || "—";
   setText("decision-model", `${String(provider).toUpperCase()} · ${model}`);
+  setText(
+    "decision-role",
+    deterministic
+      ? "Deterministic direction and exits"
+      : "Entry confirm / veto; exits deterministic",
+  );
   setText("scan-timeframe", automation.scan_timeframe || "M5 close");
   setText("scan-confirmation", automation.confirmation_timeframes || "M15 / H1 / H4");
   const scanStatus = automation.scan_status || decision.stage || "NOT STARTED";
@@ -1035,8 +1049,9 @@ function renderCapitalFits(fits, account) {
   const lowestRisk = Math.min(...values.map(([, fit]) => finite(fit.min_stop_risk_usd, Infinity)));
   if (Number.isFinite(lowestRisk)) setText("budget-detail", `Execution only: lowest current stop risk ${money(lowestRisk, currency)}`);
 
-  const fragment = document.createDocumentFragment();
-  for (const [symbol, fit] of values) {
+  const primary = document.createDocumentFragment();
+  const secondary = document.createDocumentFragment();
+  for (const [index, [symbol, fit]] of values.entries()) {
     const setupBlocked = String(fit.status || "").toUpperCase() === "SETUP BLOCK";
     const card = node("article", `capital-fit-card ${fit.capital_fit ? "fit" : "blocked"}`);
     const top = node("div", "fit-top");
@@ -1049,9 +1064,7 @@ function renderCapitalFits(fits, account) {
     card.append(top, node("p", "fit-reason", fit.reason || "Awaiting broker feasibility details."));
     const stats = node("div", "fit-stats");
     const statValues = [
-      ["Maximum order loss", money(fit.risk_budget_usd, currency)],
       ["Min stop risk", finite(fit.min_stop_risk_usd) > 0 ? money(fit.min_stop_risk_usd, currency) : "—"],
-      ["Minimum lot", finite(fit.min_volume).toFixed(2)],
       ["Min margin", finite(fit.min_margin_usd) > 0 ? money(fit.min_margin_usd, currency) : "—"],
       ["Projected use", finite(fit.projected_margin_pct) > 0 ? `${finite(fit.projected_margin_pct).toFixed(1)}%` : "—"],
       ["Spread", `${finite(fit.spread_value).toFixed(1)} ${fit.spread_unit || ""}`],
@@ -1068,6 +1081,11 @@ function renderCapitalFits(fits, account) {
       stats.append(stat);
     }
     card.append(stats);
+    card.append(node(
+      "p",
+      "fit-footnote",
+      `Minimum ${finite(fit.min_volume).toFixed(2)} lot · ${finite(fit.min_margin_usd) > 0 ? money(fit.min_margin_usd, currency) : "margin pending"}`,
+    ));
     const directions = node("div", "direction-fit");
     for (const side of ["BUY", "SELL"]) {
       const sideFit = fit.directions?.[side]?.capital_fit;
@@ -1081,25 +1099,62 @@ function renderCapitalFits(fits, account) {
       directions.append(node("span", sideFit ? "ok" : "", sideLabel));
     }
     card.append(directions);
-    fragment.append(card);
+    (index < 4 ? primary : secondary).append(card);
   }
-  container.append(fragment);
+  container.append(primary);
+  if (values.length > 4) {
+    const more = node("details", "capital-fit-more");
+    const summary = node("summary", "", `Show ${values.length - 4} more markets`);
+    const grid = node("div", "capital-fit-more-grid");
+    grid.append(secondary);
+    more.append(summary, grid);
+    container.append(more);
+  }
 }
 
 function renderShadowEvidence(shadow) {
   if (!shadow.enabled) {
     setText("shadow-summary", "Rejected-signal outcome evaluation is disabled.");
+    setText("shadow-gates", "Recent gate outcomes are unavailable.");
+    setText("shadow-directions", "BUY/SELL execution balance is unavailable.");
     return;
   }
   const resolved = Math.max(0, Math.floor(finite(shadow.resolved)));
   const pending = Math.max(0, Math.floor(finite(shadow.pending)));
+  const windowHours = Math.max(1, Math.floor(finite(shadow.evidence_window_hours) || 48));
   if (!resolved) {
     setText("shadow-summary", `${pending} rejected signal${pending === 1 ? "" : "s"} awaiting broker-price outcomes; no rule changes are made from this data yet.`);
+    setText("shadow-gates", `No rejected signals have resolved in the last ${windowHours} hours.`);
+    setText("shadow-directions", "No BUY/SELL candidate evidence is available for the rolling window.");
     return;
   }
   setText(
     "shadow-summary",
     `Rejected-signal evidence: ${resolved} resolved, ${pending} pending · ${finite(shadow.win_rate_pct).toFixed(1)}% positive · ${finite(shadow.expectancy_r).toFixed(2)} R average. Diagnostic only.`,
+  );
+  const gates = Array.isArray(shadow.gate_breakdown) ? shadow.gate_breakdown : [];
+  setText(
+    "shadow-gates",
+    gates.length
+      ? `Last ${windowHours}h gate outcomes: ${gates.map((gate) => `${gate.gate} ${gate.wins}/${gate.resolved} positive, ${finite(gate.expectancy_r).toFixed(2)} R`).join(" · ")}.`
+      : `No rejected signals have resolved in the last ${windowHours} hours.`,
+  );
+  const directions = Array.isArray(shadow.direction_breakdown)
+    ? shadow.direction_breakdown
+    : [];
+  setText(
+    "shadow-directions",
+    directions.length
+      ? `${windowHours}h direction funnel: ${directions.map((side) => {
+          const action = String(side.action || "").toUpperCase();
+          const candidates = Math.max(0, Math.floor(finite(side.candidates)));
+          const executed = Math.max(0, Math.floor(finite(side.executed)));
+          const rejected = Math.max(0, Math.floor(finite(side.rejected)));
+          const shadowResolved = Math.max(0, Math.floor(finite(side.shadow_resolved)));
+          return `${action} ${executed}/${candidates} executed, ${rejected} rejected, `
+            + `${shadowResolved} replayed at ${finite(side.shadow_expectancy_r).toFixed(2)} R`;
+        }).join(" · ")}. Diagnostic only; it never changes entry rules automatically.`
+      : "No BUY/SELL candidate evidence is available for the rolling window.",
   );
 }
 
@@ -1167,6 +1222,19 @@ function updateTemporalUi() {
   setText("scan-countdown", `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`);
   $("scan-ring")?.style.setProperty("--scan-progress", `${elapsed / interval * 100}%`);
   setText("server-clock", `${new Date(now).toISOString().slice(11, 19)} UTC`);
+  const streamAge = app.lastMessageAt
+    ? Math.max(0, (Date.now() - app.lastMessageAt) / 1000)
+    : null;
+  setText(
+    "runtime-freshness",
+    streamAge === null
+      ? "Connecting"
+      : streamAge < 1
+        ? "Live · <1s"
+        : streamAge < 5
+          ? `Live · ${streamAge.toFixed(1)}s`
+          : `Stale · ${Math.floor(streamAge)}s`,
+  );
   updateConnectionStatus();
 
   if (app.state?.prices) {
@@ -1490,6 +1558,7 @@ function fillSettings(config) {
   $("c-candidates").value = (config.market_candidate_symbols || config.symbols || []).join(",");
   $("c-dynamic-markets").value = String(Boolean(config.dynamic_market_selection_enabled));
   $("c-market-max").value = config.dynamic_market_max_symbols ?? 6;
+  $("c-model-candidates").value = config.llm_entry_candidates_per_bar ?? 3;
   $("c-market-refresh").value = config.market_selection_refresh_seconds ?? 60;
   $("c-analysis").value = config.analysis_interval_seconds ?? 60;
   $("c-provider").value = config.llm_provider || "local";
@@ -1503,12 +1572,31 @@ function fillSettings(config) {
   $("c-rr").step = "0.01";
   $("c-rr").value = config.min_risk_reward_ratio ?? 1.47;
   $("c-confidence").value = config.confidence_threshold ?? .7;
+  $("c-failed-reversal").value = String(
+    config.failed_thesis_reversal_enabled ?? true
+  );
+  $("c-failed-reversal-confidence").value =
+    config.failed_thesis_reversal_min_confidence ?? .65;
+  $("c-failed-reversal-bars").value =
+    config.failed_thesis_reversal_max_age_bars ?? 18;
+  $("c-failed-reversal-m5-adx").value =
+    config.failed_thesis_reversal_min_m5_adx ?? 25;
+  $("c-failed-reversal-m15-adx").value =
+    config.failed_thesis_reversal_min_m15_adx ?? 19.1;
   $("c-spread").value = config.max_spread_pips ?? 3;
   $("c-entry-adx").value = config.entry_min_adx ?? 25;
   $("c-adx-rising").value = String(config.entry_require_adx_rising ?? true);
   $("c-adx-decline").value = config.entry_adx_decline_tolerance ?? .5;
+  $("c-aligned-adx-decline").value =
+    config.entry_aligned_adx_decline_tolerance ?? 1.5;
+  $("c-entry-max-extension").value = config.entry_max_candle_range_atr ?? 1.5;
+  $("c-aligned-chase-confidence").value =
+    config.entry_strong_alignment_chase_min_confidence ?? .85;
+  $("c-aligned-chase-extension").value =
+    config.entry_strong_alignment_chase_max_extension_atr ?? 2;
   $("c-breakout-displacement").value = config.breakout_min_displacement_atr ?? .1;
   $("c-zone-distance").value = config.entry_min_opposing_distance_atr ?? .75;
+  $("c-unconfirmed-bos-zone").value = config.entry_unconfirmed_bos_min_opposing_distance_atr ?? 1.75;
   $("c-cost-extension").value = config.plan_max_cost_target_extension_r ?? .5;
   $("c-reentry-bars").value = config.same_thesis_reentry_min_bars ?? 2;
   $("c-retest").value = String(config.retest_continuation_enabled ?? true);
@@ -1525,10 +1613,11 @@ function fillSettings(config) {
   $("c-fast-exit").value = String(config.fast_exit_review_enabled ?? true);
   $("c-exit-timeframe").value = config.position_exit_review_timeframe || "M1";
   $("c-profit-lock").value = String(config.profit_lock_enabled ?? true);
-  $("c-lock-trigger").value = config.profit_lock_trigger_r ?? .75;
-  $("c-lock-floor").value = config.profit_lock_floor_usd ?? .03;
+  $("c-lock-trigger").value = config.profit_lock_trigger_r ?? .50;
+  $("c-lock-floor").value = config.profit_lock_floor_usd ?? .08;
   $("c-giveback").value = String(config.profit_giveback_enabled ?? true);
   $("c-giveback-trigger").value = config.profit_giveback_trigger_r ?? .5;
+  $("c-giveback-close-min").value = config.profit_giveback_close_min_r ?? 1;
   $("c-giveback-fraction").value = config.profit_giveback_fraction ?? .5;
   $("c-breakeven-r").value = config.breakeven_trigger_r ?? .75;
   $("c-trailing-r").value = config.trailing_trigger_r ?? 1;
@@ -1587,7 +1676,7 @@ function syncQuantizationProfile() {
   // contract; hidden concurrency changes previously caused readiness failure.
   const concurrency = 1;
   const profileLabel = quantization === "AUTO"
-    ? "follows Q6_K / Q8_0"
+    ? "follows Q4_K_M / Q6_K / Q8_0"
     : quantization;
   setText(
     "c-concurrency-profile",
@@ -1595,14 +1684,14 @@ function syncQuantizationProfile() {
   );
   const health = app.localModelHealth || {};
   const loaded = health.quantization || "not detected";
-  const supported = health.supported_quantizations || ["Q6_K", "Q8_0"];
+  const supported = health.supported_quantizations || ["Q4_K_M", "Q6_K", "Q8_0"];
   const matches = quantization === "AUTO"
     ? supported.includes(loaded)
     : loaded === quantization;
   const status = matches
     ? "match"
     : quantization === "AUTO"
-      ? "load Q6_K or Q8_0"
+      ? "load Q4_K_M, Q6_K, or Q8_0"
       : "load the selected variant";
   setText(
     "c-quantization-hint",
@@ -1630,11 +1719,11 @@ async function saveSettings(event) {
       MARKET_CANDIDATE_SYMBOLS: $("c-candidates").value,
       DYNAMIC_MARKET_SELECTION_ENABLED: $("c-dynamic-markets").value,
       DYNAMIC_MARKET_MAX_SYMBOLS: $("c-market-max").value,
+      LLM_ENTRY_CANDIDATES_PER_BAR: $("c-model-candidates").value,
       MARKET_SELECTION_REFRESH_SECONDS: $("c-market-refresh").value,
       ANALYSIS_INTERVAL_SECONDS: $("c-analysis").value,
       LLM_PROVIDER: $("c-provider").value,
       LOCAL_LLM_REQUIRED_QUANTIZATION: $("c-quantization").value,
-      LLM_MAX_CONCURRENCY: "1",
       OPENAI_REASONING_EFFORT: $("c-reasoning").value,
       RISK_PERCENT: $("c-risk").value,
       MAX_PORTFOLIO_RISK_PCT: $("c-portfolio").value,
@@ -1642,12 +1731,25 @@ async function saveSettings(event) {
       MAX_MARGIN_USAGE_PCT: $("c-margin").value,
       MIN_RISK_REWARD_RATIO: $("c-rr").value,
       CONFIDENCE_THRESHOLD: $("c-confidence").value,
+      FAILED_THESIS_REVERSAL_ENABLED: $("c-failed-reversal").value,
+      FAILED_THESIS_REVERSAL_MIN_CONFIDENCE: $("c-failed-reversal-confidence").value,
+      FAILED_THESIS_REVERSAL_MAX_AGE_BARS: $("c-failed-reversal-bars").value,
+      FAILED_THESIS_REVERSAL_MIN_M5_ADX: $("c-failed-reversal-m5-adx").value,
+      FAILED_THESIS_REVERSAL_MIN_M15_ADX: $("c-failed-reversal-m15-adx").value,
       MAX_SPREAD_PIPS: $("c-spread").value,
       ENTRY_MIN_ADX: $("c-entry-adx").value,
       ENTRY_REQUIRE_ADX_RISING: $("c-adx-rising").value,
       ENTRY_ADX_DECLINE_TOLERANCE: $("c-adx-decline").value,
+      ENTRY_ALIGNED_ADX_DECLINE_TOLERANCE:
+        $("c-aligned-adx-decline").value,
+      ENTRY_MAX_CANDLE_RANGE_ATR: $("c-entry-max-extension").value,
+      ENTRY_STRONG_ALIGNMENT_CHASE_MIN_CONFIDENCE:
+        $("c-aligned-chase-confidence").value,
+      ENTRY_STRONG_ALIGNMENT_CHASE_MAX_EXTENSION_ATR:
+        $("c-aligned-chase-extension").value,
       BREAKOUT_MIN_DISPLACEMENT_ATR: $("c-breakout-displacement").value,
       ENTRY_MIN_OPPOSING_DISTANCE_ATR: $("c-zone-distance").value,
+      ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR: $("c-unconfirmed-bos-zone").value,
       PLAN_MAX_COST_TARGET_EXTENSION_R: $("c-cost-extension").value,
       SAME_THESIS_REENTRY_MIN_BARS: $("c-reentry-bars").value,
       RETEST_CONTINUATION_ENABLED: $("c-retest").value,
@@ -1666,6 +1768,7 @@ async function saveSettings(event) {
       PROFIT_LOCK_FLOOR_USD: $("c-lock-floor").value,
       PROFIT_GIVEBACK_ENABLED: $("c-giveback").value,
       PROFIT_GIVEBACK_TRIGGER_R: $("c-giveback-trigger").value,
+      PROFIT_GIVEBACK_CLOSE_MIN_R: $("c-giveback-close-min").value,
       PROFIT_GIVEBACK_FRACTION: $("c-giveback-fraction").value,
       BREAKEVEN_TRIGGER_R: $("c-breakeven-r").value,
       TRAILING_TRIGGER_R: $("c-trailing-r").value,

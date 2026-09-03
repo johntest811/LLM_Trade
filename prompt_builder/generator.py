@@ -1,8 +1,8 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from app_config.settings import settings
-from core.evidence import build_evidence_ids
+from core.evidence import build_evidence_ids, permitted_entry_actions
 from prompt_builder.templates import PromptTemplateBuilder
 
 logger = logging.getLogger("TradingSystem.PromptGenerator")
@@ -294,6 +294,8 @@ class PromptGenerator:
             m5_trigger_text = f"AVAILABLE ({m5_triggers})"
         else:
             m5_trigger_text = "NONE (No M5 BOS, CHoCH, breakout, retest, or range ID. YOU MUST CHOOSE HOLD with evidence_ids=[])"
+        entry_actions = permitted_entry_actions(evidence_ids)
+        entry_contract = ", ".join(entry_actions) if entry_actions else "HOLD ONLY"
 
         # Compress FVG array
         fvgs = ms.get("fair_value_gaps", [])
@@ -365,6 +367,7 @@ Current Technical Setup: {bias_summary}
 - Verified M5 pullback retest: {retest_str}
 - Deterministic M5 range reversal: {range_str}
 - Allowed Evidence IDs: {list(evidence_ids)}
+- Deterministic Entry Contract: {entry_contract}
 - M5 Entry Triggers Status: {m5_trigger_text}
 - news: {news_str}
 - broker-derived FX context: {fx_context_str}
@@ -373,9 +376,10 @@ Current Technical Setup: {bias_summary}
 ### DECISION
 Use the explicit trend states and CHoCH/BOS events before the slower regime label.
 CHoCH is early reversal evidence; BOS confirms direction; a PULLBACK state is not a reversal.
-Choose BUY or SELL when an M5 Entry Trigger ID is AVAILABLE in the list above, and momentum and structure agree with ADX >= {settings.entry_min_adx:.0f}.
+The deterministic entry contract owns direction. Confirm one listed action or veto it with HOLD; never choose a direction outside that contract.
+Choose a permitted BUY or SELL only when its M5 Entry Trigger ID is AVAILABLE and momentum and structure agree with ADX >= {settings.entry_min_adx:.0f}.
 IF M5 Entry Triggers Status is NONE, OUTPUT HOLD WITH evidence_ids=[].
-An M5_RETEST or aligned M5_TREND ID with M15/H1 alignment is a valid fresh entry trigger when momentum agrees.
+An M5_RETEST ID with M15/H1 alignment is a valid fresh entry trigger when momentum agrees. A trend label by itself is context, not an entry trigger.
 An early reversal requires matching M5 and M15 direction plus CHoCH or a momentum-confirmed breakout.
 A supplied M5_RANGE ID is the sole low-ADX exception. Choose only the direction encoded by that ID, or HOLD.
 {counter_h4_rule}

@@ -381,11 +381,20 @@ class MT5DataReader:
 
         return await asyncio.to_thread(_fetch)
 
-    async def get_live_tick(self, symbol: str) -> Optional[dict]:
+    async def get_live_tick(
+        self,
+        symbol: str,
+        assume_connected: bool = False,
+    ) -> Optional[dict]:
         """
         Queries the current ask/bid price tick information for a symbol.
+
+        High-frequency callers may set ``assume_connected`` only after they
+        have completed one connection heartbeat for the surrounding batch.
+        This avoids repeating a blocking terminal-status call for every symbol
+        while preserving the safe default for entry and protection callers.
         """
-        if not await self._conn.is_connected():
+        if not assume_connected and not await self._conn.is_connected():
             logger.warning("MT5 connection is offline. Cannot retrieve tick data.")
             return None
 

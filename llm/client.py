@@ -27,7 +27,7 @@ from core.evidence import build_evidence_ids
 logger = logging.getLogger("TradingSystem.DecisionService")
 
 LOCAL_LLM_AUTO_QUANTIZATION = "AUTO"
-SUPPORTED_LOCAL_LLM_QUANTIZATIONS = ("Q6_K", "Q8_0")
+SUPPORTED_LOCAL_LLM_QUANTIZATIONS = ("Q4_K_M", "Q6_K", "Q8_0")
 
 
 DECISION_SCHEMA: Dict[str, Any] = {
@@ -125,11 +125,63 @@ def _parse_json(text: str) -> Optional[Dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _local_model_aliases(model_id: object) -> set[str]:
+    """Return stable LM Studio aliases for a configured or loaded model ID.
+
+    LM Studio's catalog uses IDs such as ``qwen/qwen3.5-4b``, while a locally
+    imported GGUF can expose the shorter API identifier ``qwen3.5-4b``. Those
+    names refer to the same selectable model and must not fail readiness solely
+    because one side includes the publisher namespace.
+    """
+    normalized = str(model_id or "").strip().casefold()
+    if not normalized:
+        return set()
+    aliases = {normalized}
+    if "/" in normalized:
+        aliases.add(normalized.rsplit("/", 1)[-1])
+    return aliases
+
+
+def _local_model_ids_match(configured: object, candidate: object) -> bool:
+    return bool(
+        _local_model_aliases(configured) & _local_model_aliases(candidate)
+    )
+
+
+def _is_qwen35_model(model_id: object) -> bool:
+    return any(alias.startswith("qwen3.5-") for alias in _local_model_aliases(model_id))
+
+
+def _is_bonsai27_model(model_id: object) -> bool:
+    """Recognize Prism/LM Studio aliases for the binary Bonsai 27B model."""
+    return any(
+        alias == "bonsai-27b" or alias.startswith("bonsai-27b-")
+        for alias in _local_model_aliases(model_id)
+    )
+
+
+def _requires_nonthinking_response(model_id: object) -> bool:
+    # Both model families default to a reasoning pass in LM Studio. Trading
+    # decisions are bounded JSON, so hidden reasoning must not consume the
+    # completion budget before the schema-constrained answer is emitted.
+    return _is_qwen35_model(model_id) or _is_bonsai27_model(model_id)
+
+
+def _supported_quantizations_for_model(model_id: object) -> tuple[str, ...]:
+    # Q1_0 is normally too lossy for the decision lane. Bonsai 27B is an
+    # explicitly trained binary model whose native, validated GGUF is Q1_0, so
+    # admit that quantization only for this named family.
+    if _is_bonsai27_model(model_id):
+        return (*SUPPORTED_LOCAL_LLM_QUANTIZATIONS, "Q1_0")
+    return SUPPORTED_LOCAL_LLM_QUANTIZATIONS
+
+
 class LocalDecisionProvider:
     name = "local"
 
     def __init__(self) -> None:
-        self.model = settings.local_llm_model
+        self.configured_model = settings.local_llm_model
+        self.model = self.configured_model
 
     async def request(
         self,
@@ -153,9 +205,14 @@ class LocalDecisionProvider:
                 "temperature": settings.local_llm_temperature,
                 "top_p": settings.local_llm_top_p,
                 "seed": settings.local_llm_seed,
-                "max_tokens": 350,
+                "max_tokens": settings.local_llm_max_tokens,
                 "stream": False,
             }
+            # Supported hybrid-thinking models default to reasoning in LM
+            # Studio. Keep this short deterministic lane non-thinking so the
+            # bounded completion can always reach its JSON answer.
+            if _requires_nonthinking_response(self.model):
+                payload["reasoning_effort"] = "none"
             if settings.local_llm_structured_output:
                 payload["response_format"] = {
                     "type": "json_schema",
@@ -237,7 +294,14 @@ class LocalDecisionProvider:
             payload = await asyncio.to_thread(_get, f"{base_url}/api/v1/models")
             models = payload.get("models") or []
             model_info = next(
-                (item for item in models if item.get("key") == self.model), None
+                (
+                    item
+                    for item in models
+                    if _local_model_ids_match(
+                        self.configured_model, item.get("key")
+                    )
+                ),
+                None,
             )
             if model_info is None:
                 return {
@@ -248,6 +312,15 @@ class LocalDecisionProvider:
                     "error": "Configured model is not installed in LM Studio",
                 }
             instances = model_info.get("loaded_instances") or []
+            resolved_model = str(
+                (
+                    instances[0].get("id")
+                    if instances
+                    else model_info.get("key")
+                )
+                or self.configured_model
+            )
+            self.model = resolved_model
             instance_config = (instances[0].get("config") or {}) if instances else {}
             loaded_context = instance_config.get("context_length")
             loaded_parallel = instance_config.get("parallel")
@@ -259,6 +332,9 @@ class LocalDecisionProvider:
             loaded_quantization_normalized = str(
                 loaded_quantization or ""
             ).strip().upper()
+            supported_quantizations = _supported_quantizations_for_model(
+                self.configured_model
+            )
             # LM Studio may allocate a larger context window than this client
             # needs.  That is compatible: the configured value is the minimum
             # capacity required by the trading prompts, not an exact runtime
@@ -281,7 +357,7 @@ class LocalDecisionProvider:
             if quantization_mode == "FOLLOW_LOADED":
                 quantization_matches = (
                     loaded_quantization_normalized
-                    in SUPPORTED_LOCAL_LLM_QUANTIZATIONS
+                    in supported_quantizations
                 )
             else:
                 quantization_matches = (
@@ -297,6 +373,8 @@ class LocalDecisionProvider:
                 "available": ready,
                 "loaded": bool(instances),
                 "selected_model": self.model,
+                "configured_model": self.configured_model,
+                "resolved_model": resolved_model,
                 "loaded_context_length": loaded_context,
                 "configured_context_length": configured_context,
                 "context_matches": context_matches,
@@ -307,9 +385,7 @@ class LocalDecisionProvider:
                 "quantization": loaded_quantization,
                 "required_quantization": required_quantization or None,
                 "quantization_mode": quantization_mode,
-                "supported_quantizations": list(
-                    SUPPORTED_LOCAL_LLM_QUANTIZATIONS
-                ),
+                "supported_quantizations": list(supported_quantizations),
                 "quantization_matches": quantization_matches,
             }
             if not instances:
@@ -327,7 +403,7 @@ class LocalDecisionProvider:
             elif not quantization_matches:
                 if quantization_mode == "FOLLOW_LOADED":
                     supported = " or ".join(
-                        SUPPORTED_LOCAL_LLM_QUANTIZATIONS
+                        supported_quantizations
                     )
                     result["error"] = (
                         "LM Studio loaded quantization is "
@@ -347,11 +423,25 @@ class LocalDecisionProvider:
             try:
                 payload = await asyncio.to_thread(_get, f"{base_url}/v1/models")
                 ids = [item.get("id") for item in payload.get("data", [])]
+                resolved_model = next(
+                    (
+                        model_id
+                        for model_id in ids
+                        if _local_model_ids_match(
+                            self.configured_model, model_id
+                        )
+                    ),
+                    None,
+                )
+                if resolved_model:
+                    self.model = str(resolved_model)
                 return {
                     "online": True,
-                    "available": self.model in ids,
+                    "available": resolved_model is not None,
                     "loaded": None,
                     "selected_model": self.model,
+                    "configured_model": self.configured_model,
+                    "resolved_model": resolved_model,
                     "configured_context_length": settings.local_llm_context_size,
                 }
             except Exception as fallback_exc:
