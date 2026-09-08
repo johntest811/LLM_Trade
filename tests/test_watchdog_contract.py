@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -37,6 +38,16 @@ class WatchdogContractTests(unittest.TestCase):
         self.assertIn("RedirectStandardError", self.script)
         self.assertIn("runtime_stdout.log", self.script)
         self.assertIn("runtime_stderr.log", self.script)
+
+    def test_process_detection_supports_windows_store_versioned_python(self):
+        match = re.search(r'\$_\.Name -match "([^"]+)"', self.script)
+        self.assertIsNotNone(match)
+        pattern = re.compile(match.group(1), re.IGNORECASE)
+        for name in ("python.exe", "pythonw.exe", "python3.exe", "python3.13.exe", "pythonw3.13.exe"):
+            self.assertIsNotNone(pattern.fullmatch(name), name)
+        for name in ("notpython.exe", "python-helper.exe", "powershell.exe"):
+            self.assertIsNone(pattern.fullmatch(name), name)
+        self.assertIn("[string]$_.CommandLine -match $entrypointPattern", self.script)
 
 
 if __name__ == "__main__":

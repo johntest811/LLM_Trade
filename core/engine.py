@@ -6,6 +6,7 @@ prompt building, provider-aware model decisions, risk management, and order exec
 Sends real-time updates to the global dashboard state.
 """
 import asyncio
+import copy
 import logging
 import math
 import threading
@@ -21,10 +22,16 @@ from ui.state import dashboard_state
 from core.analysis_engine import MarketAnalysisEngine
 from core.forex_context import build_currency_context
 from core.market_selector import AdaptiveMarketSelector
+from core.market_universe import discovery_batch, tradable_symbols
+from core.opportunities import screen_opportunities
+from core.profit_retention import RetentionState, advance_retention
 from core.entry_retest import annotate_retest_continuation
 from core.entry_momentum import aligned_structure_allows_adx_decline
 from core.range_reversion import annotate_range_reversion
-from core.shadow_outcomes import evaluate_shadow_candidate
+from core.shadow_outcomes import (
+    evaluate_exit_counterfactual,
+    evaluate_shadow_candidate,
+)
 from core.trade_planner import DeterministicTradePlanner, TradePlan
 from prompt_builder.generator import PromptGenerator
 from risk.manager import RiskManager
@@ -115,6 +122,10 @@ class TradingEngine:
         # refreshed top-three cannot enqueue a fourth late model request.
         self._entry_model_admissions: Dict[str, set[str]] = {}
         self._previous_trend_states: Dict[str, Dict[str, str]] = {}
+        self._broker_universe: List[str] = []
+        self._broker_scan_symbols: Tuple[str, ...] = ()
+        self._broker_universe_cursor = 0
+        self._broker_universe_refreshed = 0.0
         self._last_stale_bars: Dict[str, str] = {}
         initial_candidates = self._market_candidates_for_current_market()
         self._selected_symbols: Tuple[str, ...] = tuple(
@@ -148,9 +159,13 @@ class TradingEngine:
         self._trough_persisted_usd: Dict[int, float] = {}
         self._profit_lock_tickets: set[int] = set()
         self._profit_lock_levels: Dict[int, float] = {}
+        self._profit_retention_states: Dict[int, RetentionState] = {}
+        self._profit_retention_loaded: set = set()
+        self._profit_retention_persisted: Dict[int, RetentionState] = {}
         self._breakeven_tickets: set[int] = set()
         self._protection_failures: Dict[Tuple[int, str], Tuple[str, float]] = {}
         self._initial_risk_pips: Dict[int, float] = {}
+        self._initial_risk_usd: Dict[int, float] = {}
         self._adverse_momentum_streaks: Dict[int, int] = {}
         self.last_exit_bar_times: Dict[str, str] = {}
         self._baseline_error_tickets: set[int] = set()
@@ -241,13 +256,85 @@ class TradingEngine:
 
     def _symbols_for_current_market(self) -> List[str]:
         """Return selected markets; discovery continues over the wider pool."""
-        candidates = self._market_candidates_for_current_market()
+        candidates = self._candidate_universe()
         if not settings.dynamic_market_selection_enabled:
             return candidates
         selected = [symbol for symbol in self._selected_symbols if symbol in candidates]
         if self._market_selection_initialized:
             return selected
         return selected or candidates[: settings.dynamic_market_max_symbols]
+
+    def _candidate_universe(self) -> List[str]:
+        configured = self._market_candidates_for_current_market()
+        if not settings.dynamic_market_selection_enabled or not settings.broker_market_discovery_enabled or is_weekend():
+            return configured
+        return list(dict.fromkeys([*configured, *getattr(self, "_broker_scan_symbols", ())]))
+
+    async def _broker_discovery_batch(self, configured: List[str]) -> List[str]:
+        if not settings.broker_market_discovery_enabled or is_weekend():
+            return configured
+        now = time.monotonic()
+        if not getattr(self, "_broker_universe_refreshed", 0.0) or now - self._broker_universe_refreshed >= settings.broker_market_refresh_seconds:
+            instruments = await asyncio.to_thread(mt5.symbols_get, group=settings.broker_market_group)
+            catalog = instruments
+            if instruments is not None and settings.broker_market_group != "*":
+                catalog = await asyncio.to_thread(mt5.symbols_get)
+            if instruments is None or catalog is None:
+                logger.warning("Broker market discovery unavailable; retaining the previous universe")
+            else:
+                # Register the full catalog so an instrument selected by a
+                # different group cannot overwrite an exact broker spelling.
+                mt5.register_symbols(catalog)
+                unique_contracts = set(tradable_symbols(catalog))
+                refreshed = [name.upper() for name in tradable_symbols(instruments) if name in unique_contracts]
+                available = set(refreshed)
+                previous = getattr(self, "_broker_universe", [])
+                retained = [name for name in previous if name in available]
+                retained_set = set(retained)
+                # Symbol selection changes Market Watch visibility. Preserve
+                # catalog order on refresh so it cannot disrupt rotation.
+                self._broker_universe = retained + [name for name in refreshed if name not in retained_set]
+                if retained != previous:
+                    self._broker_universe_cursor = 0
+                self._broker_universe_refreshed = now
+        batch, self._broker_universe_cursor = discovery_batch(
+            configured, getattr(self, "_selected_symbols", ()),
+            getattr(self, "_broker_universe", []),
+            getattr(self, "_broker_universe_cursor", 0), settings.broker_market_batch_size,
+        )
+        return batch
+
+    async def _confirmed_entry_analyses(self, symbol: str, m5_frame: Any, confirmations=None) -> Dict[str, Any]:
+        """Use the same completed-candle setup construction in discovery and entry."""
+        frames = confirmations if confirmations is not None else await asyncio.gather(*(
+            self.reader.get_ohlcv(symbol, timeframe, count=max(220, settings.analysis_history_bars))
+            for timeframe in ("M15", "H1", "H4")
+        ))
+        if any(frame is None or frame.empty or frame.attrs.get("is_stale", False) for frame in frames):
+            return {}
+        analyses = {}
+        for timeframe, frame in zip(("M5", "M15", "H1", "H4"), (m5_frame, *frames)):
+            analysis = await asyncio.to_thread(self.analyzer.analyze, symbol, timeframe, frame)
+            if not analysis:
+                return {}
+            analyses[timeframe] = copy.deepcopy(analysis)
+        # A retest transition is a property of adjacent completed candles,
+        # not of when this market happened to enter the active watch list.
+        previous = None
+        if len(m5_frame) >= 2:
+            # Do not turn a weekend/session gap into a fresh retest.
+            current_time = m5_frame.iloc[-1]["time"]
+            previous_time = m5_frame.iloc[-2]["time"]
+            try:
+                adjacent = (current_time - previous_time).total_seconds() == 300
+            except (TypeError, AttributeError):
+                adjacent = False
+            if adjacent:
+                previous = await asyncio.to_thread(self.analyzer.analyze, symbol, "M5", m5_frame.iloc[:-1])
+        previous_state = (previous or {}).get("market_structure", {}).get("trend_state", "NEUTRAL")
+        annotate_retest_continuation(analyses["M5"], analyses["M15"], analyses["H1"], {"M5": previous_state})
+        annotate_range_reversion(analyses["M5"], analyses["M15"], analyses["H1"], analyses["H4"])
+        return analyses
 
     def _symbols_with_position_priority(
         self, positions: List[Dict[str, Any]]
@@ -319,7 +406,7 @@ class TradingEngine:
                 return " · ".join(
                     ["MONITORING M5", f"{healthy_count} READY", *issues]
                 )
-            return "WAITING FOR NEXT M5 CLOSE"
+            return "MONITORING TICKS - NEXT ENTRY ON M5 CLOSE"
 
         if all(state == "STALE" for state in states.values()):
             return f"STALE M5 DATA · {', '.join(symbols)}"
@@ -362,19 +449,20 @@ class TradingEngine:
             }
             dashboard_state.update_market_fit(symbol, result)
             return result
-        analysis = self.analyzer.analyze(symbol, "M5", frame)
-        if not analysis:
+        analyses = await self._confirmed_entry_analyses(symbol, frame)
+        if not analyses:
             result = {
                 "symbol": symbol,
                 "status": "DATA ERROR",
                 "capital_fit": False,
-                "reason": "Indicator warm-up is incomplete",
+                "reason": "Completed-candle confirmation history or indicator warm-up is incomplete",
                 "selection_score": 0.0,
                 "selection_regime": "UNKNOWN",
                 "selected": False,
             }
             dashboard_state.update_market_fit(symbol, result)
             return result
+        analysis = analyses["M5"]
         capital_fit = await asyncio.to_thread(
             DeterministicTradePlanner.assess_capital_fit,
             symbol,
@@ -382,7 +470,7 @@ class TradingEngine:
             account,
         )
         history = await self.db.get_closed_positions(
-            symbol=symbol,
+            symbol=mt5.broker_symbol_name(symbol),
             # Manual terminal/mobile closes are excluded from strategy
             # expectancy. Read extra broker rows so those exclusions do not
             # silently shrink the configured strategy sample.
@@ -399,23 +487,20 @@ class TradingEngine:
         capital_fit["m5_impulse_atr"] = float(
             analysis.get("indicators", {}).get("candle_return_atr", 0.0) or 0.0
         )
-        annotate_range_reversion(analysis)
-        entry_actions = permitted_entry_actions(
-            build_evidence_ids({"M5": analysis})
-        )
-        capital_fit["actionable_entry_evidence"] = bool(entry_actions)
-        capital_fit["permitted_entry_actions"] = list(entry_actions)
+        capital_fit.update(screen_opportunities(analyses, capital_fit, history))
         prefilter_reason = self._entry_prefilter_reason(
             analysis,
-            allow_pending_range=True,
-            allow_provisional_aligned_decline=True,
+            analyses["M15"], analyses["H1"],
         )
         capital_fit["entry_prefilter_reason"] = prefilter_reason
         capital_fit["model_eligible"] = bool(
-            capital_fit.get("capital_fit")
-            and capital_fit.get("broker_open", True)
+            capital_fit.get("model_eligible")
             and not prefilter_reason
-            and entry_actions
+        )
+        capital_fit["opportunity_bar"] = str(analysis.get("timestamp", ""))
+        capital_fit["opportunity_status"] = (
+            "READY FOR REVIEW" if capital_fit["model_eligible"] else
+            "WAITING FOR SETUP" if not capital_fit["actionable_entry_evidence"] else "BLOCKED"
         )
         capital_fit.update(AdaptiveMarketSelector.score(symbol, analysis, capital_fit))
         dashboard_state.update_market_fit(symbol, capital_fit)
@@ -427,7 +512,14 @@ class TradingEngine:
         """Discover and rank broker-open markets without placing orders."""
         if not settings.dynamic_market_selection_enabled:
             return
-        candidates = self._market_candidates_for_current_market()
+        configured_candidates = self._market_candidates_for_current_market()
+        candidates = await self._broker_discovery_batch(configured_candidates)
+        active_identity = getattr(self, "_active_account_identity", None)
+        if active_identity is not None and not self._same_account(account, active_identity):
+            return
+        if configured_candidates != self._market_candidates_for_current_market():
+            return
+        self._broker_scan_symbols = tuple(candidates)
         dashboard_state.retain_market_scope(candidates)
         if not candidates:
             self._selected_symbols = tuple()
@@ -464,7 +556,7 @@ class TradingEngine:
             account, active_identity
         ):
             return
-        if candidates != self._market_candidates_for_current_market():
+        if configured_candidates != self._market_candidates_for_current_market():
             return
         self._forex_context_by_symbol = build_currency_context(ranked)
         for item in ranked:
@@ -501,9 +593,10 @@ class TradingEngine:
             ranked, settings.dynamic_market_max_symbols
         )
         selected_set = set(selected)
+        self._market_rankings = {}
         sorted_ranked = sorted(
             ranked,
-            key=lambda row: float(row.get("selection_score", 0.0) or 0.0),
+            key=lambda row: (bool(row.get("model_eligible")), float(row.get("selection_score", 0.0) or 0.0)),
             reverse=True,
         )
         eligible_rank = 0
@@ -672,6 +765,25 @@ class TradingEngine:
             **values,
         )
 
+    async def _remember_strategy_close_reason(
+        self,
+        ticket: int,
+        reason: str,
+    ) -> None:
+        """Keep an application-led close cause across broker reconciliation."""
+        ticket = int(ticket)
+        normalized = str(reason or "").strip().upper()
+        if ticket <= 0 or not normalized:
+            return
+        if not hasattr(self, "_pending_close_reasons"):
+            self._pending_close_reasons = {}
+        self._pending_close_reasons[ticket] = normalized
+        account = dict(getattr(self, "_active_account_identity", None) or {})
+        account_login = int(account.get("login", 0) or 0)
+        writer = getattr(self.db, "set_strategy_close_reason", None)
+        if account_login > 0 and writer is not None:
+            await writer(account_login, ticket, normalized)
+
     async def _record_shadow_candidate(
         self,
         *,
@@ -699,8 +811,12 @@ class TradingEngine:
         )
 
     async def _refresh_shadow_outcomes(self) -> None:
-        pending = await asyncio.to_thread(
-            self.replay_logger.get_pending_shadow_candidates, 100
+        pending = (
+            await asyncio.to_thread(
+                self.replay_logger.get_pending_shadow_candidates, 100
+            )
+            if settings.shadow_outcomes_enabled
+            else []
         )
         if pending:
             by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -728,10 +844,58 @@ class TradingEngine:
                         mfe_r=resolution.mfe_r,
                         mae_r=resolution.mae_r,
                     )
+        if getattr(settings, "exit_counterfactual_enabled", True):
+            exit_candidates = await asyncio.to_thread(
+                self.replay_logger.get_pending_exit_candidates, 100
+            )
+            if exit_candidates:
+                by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+                for candidate in exit_candidates:
+                    by_symbol.setdefault(
+                        str(candidate.get("symbol", "")).upper(), []
+                    ).append(candidate)
+                for symbol, candidates in by_symbol.items():
+                    if not symbol:
+                        continue
+                    max_horizon = max(
+                        float(row.get("horizon_minutes", 60.0) or 60.0)
+                        for row in candidates
+                    )
+                    bars = await self.reader.get_ohlcv(
+                        symbol, "M1", count=max(180, int(max_horizon) + 30)
+                    )
+                    if bars is None or bars.empty:
+                        continue
+                    for candidate in candidates:
+                        resolution = evaluate_exit_counterfactual(
+                            candidate, bars
+                        )
+                        if resolution is None:
+                            continue
+                        await asyncio.to_thread(
+                            self.replay_logger.resolve_exit_candidate,
+                            int(candidate["id"]),
+                            status=resolution.status,
+                            resolved_at_utc=resolution.resolved_at_utc,
+                            exit_price=resolution.exit_price,
+                            outcome_r=resolution.outcome_r,
+                            delta_vs_realized_r=(
+                                resolution.delta_vs_realized_r
+                            ),
+                            post_exit_mfe_r=resolution.post_exit_mfe_r,
+                            post_exit_mae_r=resolution.post_exit_mae_r,
+                        )
         summary = await asyncio.to_thread(self.replay_logger.shadow_summary)
+        exit_summary = await asyncio.to_thread(
+            self.replay_logger.exit_counterfactual_summary
+        )
         dashboard_state.update_shadow(
             enabled=settings.shadow_outcomes_enabled,
+            exit_enabled=getattr(
+                settings, "exit_counterfactual_enabled", True
+            ),
             **summary,
+            **exit_summary,
         )
 
     async def _shadow_outcome_loop(self) -> None:
@@ -739,7 +903,10 @@ class TradingEngine:
         while self.is_running:
             cycle_started = time.monotonic()
             try:
-                if settings.shadow_outcomes_enabled:
+                if (
+                    settings.shadow_outcomes_enabled
+                    or getattr(settings, "exit_counterfactual_enabled", True)
+                ):
                     await self._refresh_shadow_outcomes()
                 else:
                     dashboard_state.update_shadow(enabled=False)
@@ -1394,13 +1561,17 @@ class TradingEngine:
             "_peak_persisted_usd",
             "_trough_persisted_usd",
             "_initial_risk_pips",
+            "_initial_risk_usd",
             "_adverse_momentum_streaks",
             "_profit_lock_levels",
+            "_profit_retention_states",
+            "_profit_retention_persisted",
         ):
             getattr(self, name, {}).pop(ticket, None)
         for name in (
             "_peak_state_loaded",
             "_profit_lock_tickets",
+            "_profit_retention_loaded",
             "_breakeven_tickets",
             "_baseline_error_tickets",
         ):
@@ -1560,9 +1731,18 @@ class TradingEngine:
                 },
             )
             canonical = float(row.get("initial_risk_pips", 0.0) or 0.0)
+            canonical_usd = float(
+                row.get("initial_risk_usd", initial_risk_usd)
+                or initial_risk_usd
+            )
             if not math.isfinite(canonical) or canonical <= 0:
                 raise ValueError("Persisted initial risk is invalid")
+            if not math.isfinite(canonical_usd) or canonical_usd <= 0:
+                raise ValueError("Persisted initial dollar risk is invalid")
             self._initial_risk_pips[int(ticket)] = canonical
+            if not hasattr(self, "_initial_risk_usd"):
+                self._initial_risk_usd = {}
+            self._initial_risk_usd[int(ticket)] = canonical_usd
             self._baseline_error_tickets.discard(int(ticket))
             return canonical, True
         except Exception as exc:
@@ -1590,6 +1770,14 @@ class TradingEngine:
                 if not math.isfinite(canonical) or canonical <= 0:
                     raise ValueError("Stored initial risk is invalid")
                 self._initial_risk_pips[ticket] = canonical
+                canonical_usd = float(
+                    stored.get("initial_risk_usd", 0.0) or 0.0
+                )
+                if not math.isfinite(canonical_usd) or canonical_usd <= 0:
+                    raise ValueError("Stored initial dollar risk is invalid")
+                if not hasattr(self, "_initial_risk_usd"):
+                    self._initial_risk_usd = {}
+                self._initial_risk_usd[ticket] = canonical_usd
                 self._baseline_error_tickets.discard(ticket)
                 return canonical, True
 
@@ -2443,7 +2631,7 @@ class TradingEngine:
             symbol_info.spread,
         )
         history = await self.db.get_closed_positions(
-            symbol=symbol,
+            symbol=mt5.broker_symbol_name(symbol),
             limit=20,
             account_login=self._active_account_login,
         )
@@ -2661,7 +2849,9 @@ class TradingEngine:
             if not result.success:
                 return False, result.error or "Close failed"
             if percent >= 99.999 and int(position.magic) == settings.strategy_magic:
-                self._pending_close_reasons[int(ticket)] = "OPERATOR_CLOSE"
+                await self._remember_strategy_close_reason(
+                    int(ticket), "OPERATOR_CLOSE"
+                )
             self.log(f"Operator close verified for ticket {ticket} ({percent:.0f}%).")
             return True, "Close verified"
 
@@ -2707,6 +2897,29 @@ class TradingEngine:
         by_ticket = {
             int(row.get("ticket", 0) or 0): row for row in baselines
         }
+        account_login = int(account.get("login", 0) or 0)
+        position_ids = [
+            int(row.get("position_id", 0) or 0) for row in rows
+        ]
+        reason_reader = getattr(self.db, "get_strategy_close_reasons", None)
+        strategy_close_reasons = (
+            await reason_reader(account_login, position_ids)
+            if reason_reader is not None and account_login > 0
+            else {}
+        )
+        strategy_close_reasons.update(
+            {
+                int(ticket): str(reason).strip().upper()
+                for ticket, reason in getattr(
+                    self, "_pending_close_reasons", {}
+                ).items()
+                if int(ticket) in position_ids and str(reason).strip()
+            }
+        )
+        generic_broker_reasons = {
+            "", "CLIENT", "MOBILE", "WEB", "EXPERT", "OTHER",
+            "UNKNOWN", "SIGNAL",
+        }
         symbols = {
             str(row.get("symbol", "")).strip()
             for row in rows
@@ -2730,6 +2943,16 @@ class TradingEngine:
             )
             profit_pips = signed_move / one_pip if one_pip > 0 else 0.0
             baseline = by_ticket.get(int(row.get("position_id", 0) or 0), {})
+            position_id = int(row.get("position_id", 0) or 0)
+            broker_close_reason = str(
+                row.get("close_reason", "") or ""
+            ).strip().upper()
+            strategy_close_reason = strategy_close_reasons.get(position_id, "")
+            if (
+                broker_close_reason in generic_broker_reasons
+                and strategy_close_reason
+            ):
+                row["close_reason"] = strategy_close_reason
             initial_risk_pips = float(
                 baseline.get("initial_risk_pips", 0.0) or 0.0
             )
@@ -2816,6 +3039,15 @@ class TradingEngine:
                     mfe_usd=float(trade.get("mfe_usd", 0.0) or 0.0),
                     mae_usd=float(trade.get("mae_usd", 0.0) or 0.0),
                     rr_achieved=float(trade.get("rr_achieved", 0.0) or 0.0),
+                )
+            if getattr(settings, "exit_counterfactual_enabled", True):
+                await asyncio.to_thread(
+                    self.replay_logger.log_exit_candidates,
+                    account_login=account_login,
+                    trades=history[:20],
+                    horizons_minutes=list(
+                        settings.exit_counterfactual_horizons_minutes
+                    ),
                 )
             self._history_ready = True
             return True
@@ -3047,12 +3279,19 @@ class TradingEngine:
                             "tp": float(position.tp or 0.0),
                             "profit": float(position.profit),
                             "estimated_net_profit_usd": (
-                                float(position.profit) - configured_cost
+                                float(position.profit)
+                                + float(getattr(position, "swap", 0.0) or 0.0)
+                                - configured_cost
                             ),
                             "profit_pips": profit_pips,
                             "peak_profit_pips": peak_pips,
                             "peak_profit_usd": peak_usd,
                             "initial_risk_pips": initial_risk_pips,
+                            "initial_risk_usd": getattr(
+                                self, "_initial_risk_usd", {}
+                            ).get(
+                                int(position.ticket), 0.0
+                            ),
                             "duration_min": duration_min,
                             "bot_owned": bot_owned,
                             "account_identity": dict(account),
@@ -3135,9 +3374,13 @@ class TradingEngine:
                     self._trough_persisted_usd.clear()
                     self._profit_lock_tickets.clear()
                     self._profit_lock_levels.clear()
+                    self._profit_retention_states.clear()
+                    self._profit_retention_loaded.clear()
+                    self._profit_retention_persisted.clear()
                     self._breakeven_tickets.clear()
                     self._protection_failures.clear()
                     self._initial_risk_pips.clear()
+                    self._initial_risk_usd.clear()
                     self._baseline_error_tickets.clear()
                     self.last_scan_times.clear()
                     self.last_bar_times.clear()
@@ -3158,6 +3401,11 @@ class TradingEngine:
                     self._market_selection_initialized = False
                     self._last_market_selection_monotonic = 0.0
                     self._market_rankings.clear()
+                    self._broker_universe = []
+                    self._broker_scan_symbols = ()
+                    self._broker_universe_cursor = 0
+                    self._broker_universe_refreshed = 0.0
+                    self.analyzer = MarketAnalysisEngine()
                     self._forex_context_by_symbol.clear()
                     self._symbol_point_cache.clear()
                     self._selected_symbols = tuple(
@@ -3264,7 +3512,9 @@ class TradingEngine:
                             except (TypeError, ValueError, OverflowError):
                                 execution_cost_usd = 0.0
                         estimated_net_profit_usd = (
-                            float(p.profit) - execution_cost_usd
+                            float(p.profit)
+                            + float(getattr(p, "swap", 0.0) or 0.0)
+                            - execution_cost_usd
                         )
                         peak_pips, peak_profit_usd = (
                             await self._restore_and_update_position_peak(
@@ -3313,7 +3563,18 @@ class TradingEngine:
                             "profit_lock_armed": (
                                 int(p.ticket) in self._profit_lock_tickets
                             ),
+                            "profit_lock_floor_usd": self._profit_lock_levels.get(
+                                int(p.ticket), 0.0
+                            ),
+                            "profit_retention_floor_usd": getattr(
+                                self, "_profit_retention_states", {}
+                            ).get(int(p.ticket), RetentionState()).floor_usd,
                             "initial_risk_pips": initial_risk_pips,
+                            "initial_risk_usd": getattr(
+                                self, "_initial_risk_usd", {}
+                            ).get(
+                                int(p.ticket), 0.0
+                            ),
                             "duration_min": duration_min,
                             "magic": p.magic,
                             "comment": p.comment,
@@ -3648,7 +3909,7 @@ class TradingEngine:
                 # Market Watch covers the entire current broker candidate
                 # universe. Only `_symbols_for_current_market()` proceeds to
                 # expensive analysis/model decisions and possible execution.
-                symbols_to_scan = self._market_candidates_for_current_market()
+                symbols_to_scan = self._candidate_universe()
 
                 point_cache = getattr(self, "_symbol_point_cache", None)
                 if point_cache is None:
@@ -4031,7 +4292,7 @@ class TradingEngine:
         self.last_exit_bar_times[symbol] = completed_exit_bar
 
         history = await self.db.get_closed_positions(
-            symbol=symbol,
+            symbol=mt5.broker_symbol_name(symbol),
             limit=20,
             account_login=self._active_account_login,
         )
@@ -4089,8 +4350,9 @@ class TradingEngine:
                         expected_account=self._account_identity(fresh_account),
                     )
                     if result.success:
-                        self._pending_close_reasons[ticket] = (
-                            f"DETERMINISTIC_{timeframe.upper()}_REVERSAL"
+                        await self._remember_strategy_close_reason(
+                            ticket,
+                            f"DETERMINISTIC_{timeframe.upper()}_REVERSAL",
                         )
                         self.log(
                             f"Deterministic {timeframe} reversal exit closed "
@@ -4356,8 +4618,9 @@ class TradingEngine:
                 expected_account=self._account_identity(fresh_account),
             )
         if result.success:
-            self._pending_close_reasons[ticket] = (
-                f"FAST_{timeframe.upper()}_MODEL_EXIT"
+            await self._remember_strategy_close_reason(
+                ticket,
+                f"FAST_{timeframe.upper()}_MODEL_EXIT",
             )
             self.log(
                 f"Fast {timeframe} exit closed ticket {ticket} ({symbol}): "
@@ -4522,10 +4785,11 @@ class TradingEngine:
                 self.log(f"{symbol} analysis skipped: {reason}.", "WARNING")
                 return
 
-        m5_analysis = self.analyzer.analyze(symbol, "M5", df_m5)
-        m15_analysis = self.analyzer.analyze(symbol, "M15", df_m15)
-        h1_analysis = self.analyzer.analyze(symbol, "H1", df_h1)
-        h4_analysis = self.analyzer.analyze(symbol, "H4", df_h4)
+        prepared = await self._confirmed_entry_analyses(symbol, df_m5, [df_m15, df_h1, df_h4])
+        m5_analysis = prepared.get("M5")
+        m15_analysis = prepared.get("M15")
+        h1_analysis = prepared.get("H1")
+        h4_analysis = prepared.get("H4")
         if not all((m5_analysis, m15_analysis, h1_analysis, h4_analysis)):
             dashboard_state.update_symbol_decision(
                 symbol, stage="DATA ERROR", gate_reason="Indicator warm-up is incomplete"
@@ -4545,15 +4809,6 @@ class TradingEngine:
                 "H4": h4_analysis,
             }.items()
         }
-        annotate_retest_continuation(
-            m5_analysis,
-            m15_analysis,
-            h1_analysis,
-            previous_trend_states,
-        )
-        annotate_range_reversion(
-            m5_analysis, m15_analysis, h1_analysis, h4_analysis
-        )
         self._previous_trend_states[symbol] = current_trend_states
 
         tick = await self.reader.get_live_tick(symbol)
@@ -4603,6 +4858,10 @@ class TradingEngine:
                         "model_selected",
                         "model_selection_rank",
                         "entry_prefilter_reason",
+                        "opportunity_status",
+                        "viable_entry_actions",
+                        "opportunity_rejections",
+                        "opportunity_bar",
                         "performance",
                         "performance_blocked",
                         "performance_probation",
@@ -4658,12 +4917,25 @@ class TradingEngine:
             "analyses": {**decision_analyses},
         }
         fast_path_decision: Optional[Dict[str, Any]] = None
+        history = await self.db.get_closed_positions(
+            symbol=mt5.broker_symbol_name(symbol), limit=20, account_login=self._active_account_login,
+        )
         if not has_open_position:
             prefilter_reason = self._entry_prefilter_reason(
                 m5_analysis,
                 m15_analysis,
                 h1_analysis,
             )
+            opportunity = screen_opportunities(decision_analyses, capital_fit, history)
+            capital_fit.update(opportunity)
+            capital_fit["entry_prefilter_reason"] = prefilter_reason
+            capital_fit["model_eligible"] = bool(opportunity["model_eligible"] and not prefilter_reason)
+            capital_fit["opportunity_bar"] = completed_bar
+            capital_fit["opportunity_status"] = (
+                "READY FOR REVIEW" if capital_fit["model_eligible"] else
+                "WAITING FOR SETUP" if not entry_contract else "BLOCKED"
+            )
+            dashboard_state.update_market_fit(symbol, capital_fit)
             if prefilter_reason:
                 self.last_bar_times[symbol] = completed_bar
                 dashboard_state.update_symbol_decision(
@@ -4710,44 +4982,23 @@ class TradingEngine:
                     ),
                 )
                 return
+            if not opportunity["viable_entry_actions"]:
+                self.last_bar_times[symbol] = completed_bar
+                reason = "; ".join(f"{side}: {detail}" for side, detail in opportunity["opportunity_rejections"].items())
+                dashboard_state.update_symbol_decision(
+                    symbol, stage="SETUP FILTERED", action="HOLD", confidence=0.0,
+                    reasoning=reason, gate_reason=reason, inference_time_s=0.0, candle_time=completed_bar,
+                )
+                self._set_symbol_scan_state(symbol, "COMPLETE")
+                return
             fast_path_decision = self._deterministic_entry_fast_path(
                 decision_context,
                 entry_contract,
             )
             if fast_path_decision is None:
-                model_rank = capital_fit.get("model_selection_rank")
-                if (
-                    settings.dynamic_market_selection_enabled
-                    and self._market_selection_initialized
-                    and isinstance(model_rank, int)
-                    and model_rank > settings.llm_entry_candidates_per_bar
-                ):
-                    self.last_bar_times[symbol] = completed_bar
-                    reason = (
-                        "Deterministic scan completed, but this setup ranks "
-                        f"#{model_rank} outside the top "
-                        f"{settings.llm_entry_candidates_per_bar} model candidates "
-                        "for this candle. The local-model lane is reserved for the "
-                        "strongest fresh setups."
-                    )
-                    dashboard_state.update_symbol_decision(
-                        symbol,
-                        stage="RANKED STANDBY",
-                        action="HOLD",
-                        confidence=0.0,
-                        reasoning=reason,
-                        inference_time_s=0.0,
-                        gate_reason=reason,
-                        candle_time=completed_bar,
-                    )
-                    self._set_symbol_scan_state(
-                        symbol,
-                        "COMPLETE",
-                        last_scan=(
-                            f"{datetime.now().strftime('%H:%M:%S')} / {symbol}"
-                        ),
-                    )
-                    return
+                # A previous ranking snapshot cannot veto a fresh setup
+                # when higher-ranked markets failed the current preflight.
+                # The per-bar admission limit still bounds total model work.
                 admitted, admission_reason = self._reserve_entry_model_slot(
                     symbol,
                     completed_bar,
@@ -4791,11 +5042,6 @@ class TradingEngine:
             )
             self._set_symbol_scan_state(symbol, "WAITING_FOR_MODEL")
             return
-        history = await self.db.get_closed_positions(
-            symbol=symbol,
-            limit=20,
-            account_login=self._active_account_login,
-        )
         if fast_path_decision is not None:
             system_prompt = "deterministic-entry-fast-path-v1"
             user_prompt = f"{symbol} completed M5 bar {completed_bar}"
@@ -5154,7 +5400,9 @@ class TradingEngine:
                     ticket, expected_account=self._account_identity(fresh_account)
                 )
             if res.success:
-                self._pending_close_reasons[ticket] = "MODEL_EXIT"
+                await self._remember_strategy_close_reason(
+                    ticket, "MODEL_EXIT"
+                )
                 self.log(f"Successfully closed position ticket {ticket}.")
                 await self.db.log_trade({
                     "ticket": ticket,
@@ -5719,18 +5967,80 @@ class TradingEngine:
             tp=float(position.tp or 0.0),
             profit=float(position.profit),
             estimated_net_profit_usd=(
-                float(position.profit) - configured_cost
+                float(position.profit)
+                + float(getattr(position, "swap", 0.0) or 0.0)
+                - configured_cost
             ),
             profit_pips=profit_pips,
             peak_profit_pips=peak_pips,
             peak_profit_usd=peak_usd,
             initial_risk_pips=initial_risk_pips,
+            initial_risk_usd=getattr(self, "_initial_risk_usd", {}).get(
+                ticket, 0.0
+            ),
             bot_owned=(
                 int(getattr(position, "magic", 0))
                 == settings.strategy_magic
             ),
         )
         return refreshed
+
+    async def _update_profit_retention(self, position: Dict[str, Any]) -> RetentionState:
+        """Persist the desired net floor separately from an accepted broker SL."""
+        if not (settings.profit_lock_enabled and settings.profit_retention_enabled):
+            return RetentionState()
+        for name in ("_profit_retention_states", "_profit_retention_persisted"):
+            if not hasattr(self, name):
+                setattr(self, name, {})
+        if not hasattr(self, "_profit_retention_loaded"):
+            self._profit_retention_loaded = set()
+        ticket = int(position["ticket"])
+        symbol = str(position["symbol"])
+        previous = self._profit_retention_states.get(ticket, RetentionState())
+        key = self._position_peak_cache_key(self._active_account_identity, ticket) + ":retention"
+        inputs = dict(
+            net_profit_usd=position.get("estimated_net_profit_usd", position["profit"]),
+            volume=position.get("volume", 0.0),
+            initial_risk_usd=position.get("initial_risk_usd", 0.0),
+            policy=settings,
+        )
+        state = advance_retention(previous, **inputs)
+        if previous.volume > 0 and state.volume != previous.volume:
+            # The same broker SL now represents a different cash amount.
+            getattr(self, "_profit_lock_levels", {}).pop(ticket, None)
+            getattr(self, "_profit_lock_tickets", set()).discard(ticket)
+        if ticket not in self._profit_retention_loaded:
+            try:
+                stored = RetentionState.from_dict(await self.db.get_cache(key))
+                restored = advance_retention(stored, **inputs)
+                # Merge observations made while storage was temporarily unavailable.
+                if restored.volume == state.volume:
+                    state = RetentionState(
+                        max(state.peak_net_usd, restored.peak_net_usd),
+                        max(state.floor_usd, restored.floor_usd),
+                        state.volume,
+                        max(state.reference_volume, restored.reference_volume),
+                    )
+                self._profit_retention_loaded.add(ticket)
+                self._profit_retention_persisted[ticket] = stored
+            except Exception as exc:
+                self._log_protection_failure(ticket, symbol, "Profit retention restore", exc)
+        self._profit_retention_states[ticket] = state
+        persisted = self._profit_retention_persisted.get(ticket, RetentionState())
+        changed = (
+            state.floor_usd != persisted.floor_usd
+            or state.volume != persisted.volume
+            or state.reference_volume != persisted.reference_volume
+            or abs(state.peak_net_usd - persisted.peak_net_usd) >= 0.01 - 1e-9
+        )
+        if ticket in self._profit_retention_loaded and changed:
+            try:
+                if not await self.db.set_cache(key, state.to_dict()):
+                    raise RuntimeError("cache write was not confirmed")
+                self._profit_retention_persisted[ticket] = state
+            except Exception as exc:
+                self._log_protection_failure(ticket, symbol, "Profit retention persist", exc)
+        return state
 
     async def _apply_protections(
         self,
@@ -5758,6 +6068,9 @@ class TradingEngine:
             profit_pips = p["profit_pips"]
             symbol = p["symbol"]
             risk_pips = float(p.get("initial_risk_pips", 0.0) or 0.0)
+            initial_risk_usd = float(
+                p.get("initial_risk_usd", 0.0) or 0.0
+            )
             peak_profit_usd = max(
                 0.0, float(p.get("peak_profit_usd", 0.0) or 0.0)
             )
@@ -5779,6 +6092,9 @@ class TradingEngine:
                     ticket, expected_account=self._active_account_identity
                 )
                 if res.success:
+                    await self._remember_strategy_close_reason(
+                        ticket, "TARGET_PROFIT"
+                    )
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
                         ticket,
@@ -5815,6 +6131,9 @@ class TradingEngine:
                     ticket, expected_account=self._active_account_identity
                 )
                 if res.success:
+                    await self._remember_strategy_close_reason(
+                        ticket, "TARGET_LOSS"
+                    )
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
                         ticket,
@@ -5866,6 +6185,9 @@ class TradingEngine:
                     ticket, expected_account=self._active_account_identity
                 )
                 if stagnant_close.success:
+                    await self._remember_strategy_close_reason(
+                        ticket, "STAGNATION_EXIT"
+                    )
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
                         ticket,
@@ -5894,6 +6216,12 @@ class TradingEngine:
                 )
 
             # ── 3. Persisted-peak profit giveback guard ──────────────
+            retention = await self._update_profit_retention(p)
+            retention_breached = (
+                retention.floor_usd > 0
+                and math.isfinite(estimated_net_profit_usd)
+                and estimated_net_profit_usd <= retention.floor_usd + 1e-9
+            )
             giveback_level_r = peak_r * (
                 1.0 - settings.profit_giveback_fraction
             )
@@ -5931,8 +6259,9 @@ class TradingEngine:
             )
             if (
                 settings.profit_giveback_enabled
-                and giveback_close_mature
                 and (
+                    retention_breached
+                    or (giveback_close_mature and (
                     (
                         r_giveback_armed
                         and live_r <= giveback_level_r + 1e-9
@@ -5941,24 +6270,35 @@ class TradingEngine:
                         usd_giveback_armed
                         and profit_usd <= giveback_level_usd + 1e-9
                     )
+                    ))
                 )
             ):
+                close_reason = "PROFIT_RETENTION" if retention_breached else "PROFIT_GIVEBACK"
+                exit_detail = (
+                    f"Net-profit retention: peak ${retention.peak_net_usd:.2f}, "
+                    f"floor ${retention.floor_usd:.2f}, net ${estimated_net_profit_usd:.2f}"
+                    if retention_breached else
+                    f"R-based peak giveback {peak_r:.2f} R to {live_r:.2f} R"
+                )
                 self.log(
-                    f"Profit Giveback Guard triggered for ticket {ticket} "
+                    f"{close_reason} guard triggered for ticket {ticket} "
                     f"({symbol}): trade retraced from +{peak_r:.2f} R to "
                     f"{live_r:+.2f} R (broker ${profit_usd:.2f}, estimated "
                     f"net ${estimated_net_profit_usd:.2f}; peak "
-                    f"${peak_profit_usd:.2f}). Executing exit..."
+                    f"${peak_profit_usd:.2f}). {exit_detail}. Executing exit..."
                 )
                 res = await self.executor.close_position(
                     ticket, expected_account=self._active_account_identity
                 )
                 if res.success:
+                    await self._remember_strategy_close_reason(
+                        ticket, close_reason
+                    )
                     self._forget_position_runtime_state(ticket)
                     await self._update_replay_outcome(
                         ticket,
                         estimated_net_profit_usd,
-                        close_reason="PROFIT_GIVEBACK",
+                        close_reason=close_reason,
                     )
                     await self.db.log_trade({
                         "ticket": ticket,
@@ -5970,10 +6310,7 @@ class TradingEngine:
                         "sl": p.get("sl", 0.0),
                         "tp": p.get("tp", 0.0),
                         "profit": estimated_net_profit_usd,
-                        "reasoning": (
-                            f"R-based peak giveback {peak_r:.2f} R "
-                            f"to {live_r:.2f} R"
-                        ),
+                        "reasoning": exit_detail,
                         "status": "CLOSED",
                     })
                     continue
@@ -5983,15 +6320,22 @@ class TradingEngine:
 
             # ── 4. Live-profit tiered broker protection ─────────────
             # The first two tiers require both live net USD and live R. The
-            # final dollar tier deliberately remains available even when an R
-            # baseline cannot be reconstructed. Per-ticket applied levels let
-            # later tiers improve the stop without repeating the same MT5
+            # early cash tier is capped by initial R. Mature net-peak retention
+            # adds an uncapped cash milestone, then a percentage ratchet.
+            # Per-ticket applied levels
+            # let later tiers improve the stop without repeating the same MT5
             # modification every protection poll.
             lock_floor_usd, lock_tier = self._profit_lock_target(
                 live_r=live_r,
                 estimated_net_profit_usd=estimated_net_profit_usd,
                 has_r_baseline=risk_pips > 0,
+                initial_risk_usd=initial_risk_usd * (
+                    retention.volume / retention.reference_volume
+                    if retention.reference_volume > 0 else 1.0
+                ),
             )
+            if retention.floor_usd > lock_floor_usd:
+                lock_floor_usd, lock_tier = retention.floor_usd, "peak retention"
 
             applied_floor_usd = float(
                 self._profit_lock_levels.get(ticket, 0.0) or 0.0
@@ -6060,19 +6404,66 @@ class TradingEngine:
         live_r: float,
         estimated_net_profit_usd: float,
         has_r_baseline: bool,
+        initial_risk_usd: float = 0.0,
     ) -> Tuple[float, str]:
         """Return the strongest currently eligible net-profit floor and tier."""
         try:
             net_profit = float(estimated_net_profit_usd)
             current_r = float(live_r)
+            risk_usd = float(initial_risk_usd)
         except (TypeError, ValueError, OverflowError):
             return 0.0, ""
         if not math.isfinite(net_profit):
             return 0.0, ""
-        if net_profit >= settings.profit_lock_final_trigger_usd:
-            return float(settings.profit_lock_final_floor_usd), "final"
-        if not has_r_baseline or not math.isfinite(current_r):
+        if not has_r_baseline:
+            if net_profit >= settings.profit_lock_final_trigger_usd:
+                return float(settings.profit_lock_final_floor_usd), "final"
             return 0.0, ""
+        if not math.isfinite(current_r):
+            return 0.0, ""
+
+        eligible: List[Tuple[float, str]] = []
+        if (
+            not settings.profit_lock_final_fallback_only
+            and net_profit >= settings.profit_lock_final_trigger_usd
+            and current_r >= settings.profit_lock_final_trigger_r
+            and math.isfinite(risk_usd)
+            and risk_usd > 0
+        ):
+            hybrid_floor = min(
+                settings.profit_lock_final_floor_usd,
+                risk_usd * settings.profit_lock_final_max_floor_r,
+            )
+            if hybrid_floor > 0 and hybrid_floor < net_profit:
+                eligible.append((round(hybrid_floor + 1e-12, 2), "hybrid $1"))
+        elif (
+            not settings.profit_lock_final_fallback_only
+            and net_profit >= settings.profit_lock_final_trigger_usd
+            and (not math.isfinite(risk_usd) or risk_usd <= 0)
+        ):
+            # The pip baseline can occasionally survive a conversion metadata
+            # outage without its dollar companion. Retain the original bounded
+            # fallback instead of silently dropping mature protection.
+            return float(settings.profit_lock_final_floor_usd), "final"
+        if (
+            current_r >= settings.profit_lock_mature_trigger_r
+            and math.isfinite(risk_usd)
+            and risk_usd > 0
+        ):
+            floor = max(
+                settings.profit_lock_floor_usd,
+                risk_usd * settings.profit_lock_mature_floor_r,
+            )
+            # A floor at or above current cost-adjusted profit has no room for
+            # spread/slippage and cannot be placed safely. The mature trigger
+            # normally supplies ample headroom; this cap protects unusual
+            # commission or conversion cases without disabling the tier.
+            floor = min(floor, net_profit * 0.80)
+            if floor > 0:
+                eligible.append((
+                    round(floor + 1e-12, 2),
+                    f"mature {settings.profit_lock_mature_floor_r:.2f}R",
+                ))
         if (
             current_r >= settings.profit_lock_mid_trigger_r
             and net_profit >= settings.profit_lock_mid_trigger_usd
@@ -6081,10 +6472,10 @@ class TradingEngine:
                 settings.profit_lock_floor_usd,
                 net_profit * settings.profit_lock_mid_fraction,
             )
-            return round(floor + 1e-12, 2), "35%"
+            eligible.append((round(floor + 1e-12, 2), "35%"))
         if (
             current_r >= settings.profit_lock_trigger_r
             and net_profit >= settings.profit_lock_trigger_usd
         ):
-            return float(settings.profit_lock_floor_usd), "first"
-        return 0.0, ""
+            eligible.append((float(settings.profit_lock_floor_usd), "first"))
+        return max(eligible, key=lambda item: item[0]) if eligible else (0.0, "")

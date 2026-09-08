@@ -7,6 +7,7 @@ import pandas as pd
 from mt5.safe_api import mt5
 
 from app_config.settings import settings
+from risk.instruments import is_crypto_symbol, pip_size
 from mt5.timebase import (
     OFFSET_MATCH_TOLERANCE_SECONDS,
     broker_tick_age_seconds,
@@ -210,6 +211,8 @@ class MT5DataReader:
             ),
             server_offset_seconds=server_offset_seconds,
             rebuilt_from_ticks=True,
+            pip_size=pip_size(info),
+            asset_class="CRYPTO" if is_crypto_symbol(symbol, info) else "FX/CFD",
         )
         if merged.attrs["is_stale"]:
             return None
@@ -249,6 +252,8 @@ class MT5DataReader:
             now_utc = _utc_now()
             now_epoch = now_utc.timestamp()
             tick = mt5.symbol_info_tick(symbol)
+            instrument = mt5.symbol_info(symbol)
+            broker_pip = pip_size(instrument) if instrument is not None else 0.0
             server_offset_seconds = self._server_offset_seconds(symbol, tick, now_epoch)
             broker_now_epoch = now_epoch + server_offset_seconds
             broker_now = datetime.fromtimestamp(broker_now_epoch, tz=timezone.utc)
@@ -296,6 +301,8 @@ class MT5DataReader:
                     now_epoch - (latest_open + timeframe_seconds),
                 )
                 frame.attrs.update(
+                    pip_size=broker_pip,
+                    asset_class="CRYPTO" if is_crypto_symbol(symbol, instrument) else "FX/CFD",
                     source=source,
                     timeframe=timeframe,
                     latest_bar_utc=frame.iloc[-1]["time"].isoformat(),

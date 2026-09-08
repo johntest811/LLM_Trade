@@ -19,12 +19,34 @@ import MetaTrader5 as _native_mt5
 
 _NATIVE_GATE = threading.RLock()
 _T = TypeVar("_T")
+_SYMBOL_CALLS = {
+    "symbol_info", "symbol_info_tick", "symbol_select", "copy_rates_from",
+    "copy_rates_from_pos", "copy_rates_range", "copy_ticks_from", "copy_ticks_range",
+    "order_calc_profit", "order_calc_margin",
+}
 
 
 class _SerializedMT5Proxy:
     def __init__(self, module: Any) -> None:
         object.__setattr__(self, "_module", module)
         object.__setattr__(self, "_wrappers", {})
+        object.__setattr__(self, "_symbol_names", {})
+
+    def register_symbols(self, symbols: Any) -> None:
+        """Map normalized app IDs to exact broker names; never guess on ties."""
+        with _NATIVE_GATE:
+            grouped = {}
+            for item in symbols:
+                name = str(getattr(item, "name", "") or "")
+                if name:
+                    grouped.setdefault(name.upper(), set()).add(name)
+            self._symbol_names.clear()
+            self._symbol_names.update({key: next(iter(names)) for key, names in grouped.items() if len(names) == 1})
+
+    def broker_symbol_name(self, symbol: str) -> str:
+        """Resolve app IDs for exact-match broker history queries as well."""
+        with _NATIVE_GATE:
+            return self._symbol_names.get(symbol.upper(), symbol)
 
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._module, name)
@@ -35,6 +57,32 @@ class _SerializedMT5Proxy:
             @functools.wraps(attribute)
             def guarded(*args: Any, **kwargs: Any) -> Any:
                 with _NATIVE_GATE:
+                    if name in ("initialize", "login", "shutdown"):
+                        self._symbol_names.clear()
+                    if name in ("initialize", "login"):
+                        initialized = getattr(self._module, name)(*args, **kwargs)
+                        if initialized:
+                            self.register_symbols(self._module.symbols_get() or ())
+                        return initialized
+                    # The dashboard uses uppercase IDs; brokers can expose
+                    # case-sensitive contract names such as SpotBrent or .a.
+                    symbol_index = 1 if name in ("order_calc_profit", "order_calc_margin") else 0
+                    if name in _SYMBOL_CALLS and len(args) > symbol_index:
+                        positional = list(args)
+                        value = positional[symbol_index]
+                        if isinstance(value, str):
+                            positional[symbol_index] = self._symbol_names.get(value.upper(), value)
+                        args = tuple(positional)
+                    if "symbol" in kwargs:
+                        kwargs = dict(kwargs)
+                        value = kwargs["symbol"]
+                        kwargs["symbol"] = self._symbol_names.get(str(value).upper(), value)
+                    if name in ("order_check", "order_send") and len(args) == 1 and isinstance(args[0], dict):
+                        request = dict(args[0])
+                        value = request.get("symbol")
+                        if value is not None:
+                            request["symbol"] = self._symbol_names.get(str(value).upper(), value)
+                        args = (request,)
                     # MetaTrader5 5.0.5735 rejects request dictionaries that
                     # reach order_check/order_send through ``*args`` with
                     # ``(-2, 'Unnamed arguments not allowed')``.  The native

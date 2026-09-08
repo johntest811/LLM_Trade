@@ -9,6 +9,7 @@ from market_structure.breakout import BreakoutDetector
 from market_structure.candlestick import CandlestickPatternDetector
 from market_structure.smc import SMCAnalyzer
 from core.trend_state import classify_trend_state
+from risk.instruments import analysis_pip_size, is_crypto_symbol
 
 logger = logging.getLogger("TradingSystem.AnalysisEngine")
 
@@ -20,6 +21,7 @@ class MarketAnalysisEngine:
     def __init__(self) -> None:
         # Structured caching: {(symbol, timeframe): (last_candle_timestamp, analysis_dict)}
         self._cache: Dict[Tuple[str, str], Tuple[datetime, Dict[str, Any]]] = {}
+        self._previous_cache: Dict[Tuple[str, str], Tuple[datetime, Dict[str, Any]]] = {}
 
     def analyze(self, symbol: str, timeframe: str, df_candles: pd.DataFrame) -> Optional[Dict[str, Any]]:
         """
@@ -30,15 +32,9 @@ class MarketAnalysisEngine:
             logger.warning(f"Insufficient candle count ({len(df_candles)}) to run analysis for {symbol}")
             return None
 
-        # Resolve pip multiplier based on currency pair properties
-        if any(c in symbol.upper() for c in ["ETH", "LTC", "BTC"]):
-            pip_multiplier = 1.0
-        elif "XRP" in symbol.upper():
-            pip_multiplier = 100.0
-        elif any(j in symbol.upper() for j in ["JPY", "XAU", "GOLD"]):
-            pip_multiplier = 100.0
-        else:
-            pip_multiplier = 10000.0
+        # Live frames carry the broker contract's actual point/digit scale.
+        one_pip = analysis_pip_size({"symbol": symbol, "indicators": {"pip_size": df_candles.attrs.get("pip_size")}})
+        pip_multiplier = 1.0 / one_pip
 
         # Extract the latest candle close timestamp to check cache status
         latest_candle = df_candles.iloc[-1]
@@ -51,6 +47,9 @@ class MarketAnalysisEngine:
         if cached_record and cached_record[0] == latest_time:
             logger.debug(f"Cache hit: Skip recalculating unchanged candles for {symbol} ({timeframe})")
             return cached_record[1]
+        previous_record = self._previous_cache.get(cache_key)
+        if previous_record and previous_record[0] == latest_time:
+            return previous_record[1]
 
         logger.info(f"Running full market and SMC analysis for {symbol} ({timeframe})...")
 
@@ -161,9 +160,11 @@ class MarketAnalysisEngine:
         )
         analysis = {
             "symbol": symbol.upper(),
+            "asset_class": df_candles.attrs.get("asset_class") or ("CRYPTO" if is_crypto_symbol(symbol) else "FX/CFD"),
             "timeframe": timeframe.upper(),
             "timestamp": latest_time.strftime("%Y-%m-%d %H:%M:%S"),
             "indicators": {
+                "pip_size": one_pip,
                 "current_price": float(last_row['close']),
                 "ema_9": float(last_row.get('ema_9')) if pd.notna(last_row.get('ema_9')) else None,
                 "ema_21": float(last_row.get('ema_21')) if pd.notna(last_row.get('ema_21')) else None,
@@ -232,5 +233,11 @@ class MarketAnalysisEngine:
         }
 
         # Save to cache
-        self._cache[cache_key] = (latest_time, analysis)
+        cached_record = self._cache.get(cache_key)
+        if cached_record and latest_time < cached_record[0]:
+            self._previous_cache[cache_key] = (latest_time, analysis)
+        else:
+            if cached_record and latest_time > cached_record[0]:
+                self._previous_cache[cache_key] = cached_record
+            self._cache[cache_key] = (latest_time, analysis)
         return analysis

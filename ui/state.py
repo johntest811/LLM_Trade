@@ -30,6 +30,8 @@ class LivePosition:
     trough_profit_usd: float = 0.0
     estimated_net_profit_usd: float = 0.0
     profit_lock_armed: bool = False
+    profit_lock_floor_usd: float = 0.0
+    profit_retention_floor_usd: float = 0.0
     magic: int = 0
     comment: str = ""
     risk_to_sl_usd: float = 0.0
@@ -128,6 +130,13 @@ class ShadowMetrics:
     gate_breakdown: List[Dict[str, Any]] = field(default_factory=list)
     evidence_window_hours: int = 48
     direction_breakdown: List[Dict[str, Any]] = field(default_factory=list)
+    exit_enabled: bool = False
+    exit_pending: int = 0
+    exit_resolved: int = 0
+    exit_held_better: int = 0
+    exit_actual_better: int = 0
+    exit_average_delta_r: float = 0.0
+    exit_horizon_breakdown: List[Dict[str, Any]] = field(default_factory=list)
     updated_at: str = ""
 
 
@@ -302,6 +311,8 @@ class DashboardState:
                         p.get("estimated_net_profit_usd", profit), 2
                     ),
                     profit_lock_armed=bool(p.get("profit_lock_armed", False)),
+                    profit_lock_floor_usd=round(float(p.get("profit_lock_floor_usd", 0.0)), 2),
+                    profit_retention_floor_usd=round(float(p.get("profit_retention_floor_usd", 0.0)), 2),
                     duration_min=round(p.get("duration_min", 0.0), 0),
                     magic=int(p.get("magic", 0) or 0),
                     comment=str(p.get("comment", "")),
@@ -613,6 +624,11 @@ class DashboardState:
             "selected",
             "model_selected",
             "model_selection_rank",
+            "opportunity_status",
+            "viable_entry_actions",
+            "opportunity_rejections",
+            "entry_prefilter_reason",
+            "opportunity_bar",
         )
         compact = {key: value.get(key) for key in keys if key in value}
         directions = value.get("directions", {}) or {}

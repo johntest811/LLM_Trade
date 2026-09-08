@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -23,11 +24,11 @@ import requests
 
 from app_config.settings import settings
 from core.evidence import build_evidence_ids
+from llm.lmstudio import reasoning_effort, select_model
 
 logger = logging.getLogger("TradingSystem.DecisionService")
 
 LOCAL_LLM_AUTO_QUANTIZATION = "AUTO"
-SUPPORTED_LOCAL_LLM_QUANTIZATIONS = ("Q4_K_M", "Q6_K", "Q8_0")
 
 
 DECISION_SCHEMA: Dict[str, Any] = {
@@ -142,12 +143,6 @@ def _local_model_aliases(model_id: object) -> set[str]:
     return aliases
 
 
-def _local_model_ids_match(configured: object, candidate: object) -> bool:
-    return bool(
-        _local_model_aliases(configured) & _local_model_aliases(candidate)
-    )
-
-
 def _is_qwen35_model(model_id: object) -> bool:
     return any(alias.startswith("qwen3.5-") for alias in _local_model_aliases(model_id))
 
@@ -167,21 +162,15 @@ def _requires_nonthinking_response(model_id: object) -> bool:
     return _is_qwen35_model(model_id) or _is_bonsai27_model(model_id)
 
 
-def _supported_quantizations_for_model(model_id: object) -> tuple[str, ...]:
-    # Q1_0 is normally too lossy for the decision lane. Bonsai 27B is an
-    # explicitly trained binary model whose native, validated GGUF is Q1_0, so
-    # admit that quantization only for this named family.
-    if _is_bonsai27_model(model_id):
-        return (*SUPPORTED_LOCAL_LLM_QUANTIZATIONS, "Q1_0")
-    return SUPPORTED_LOCAL_LLM_QUANTIZATIONS
-
-
 class LocalDecisionProvider:
     name = "local"
 
     def __init__(self) -> None:
         self.configured_model = settings.local_llm_model
         self.model = self.configured_model
+        self._reasoning_effort = (
+            "none" if _requires_nonthinking_response(self.configured_model) else None
+        )
 
     async def request(
         self,
@@ -195,7 +184,7 @@ class LocalDecisionProvider:
         started = time.monotonic()
         last_error = ""
 
-        for attempt in range(1, settings.local_llm_max_retries + 1):
+        for attempt in range(1, max(1, settings.local_llm_max_retries) + 1):
             payload: Dict[str, Any] = {
                 "model": self.model,
                 "messages": [
@@ -208,11 +197,9 @@ class LocalDecisionProvider:
                 "max_tokens": settings.local_llm_max_tokens,
                 "stream": False,
             }
-            # Supported hybrid-thinking models default to reasoning in LM
-            # Studio. Keep this short deterministic lane non-thinking so the
-            # bounded completion can always reach its JSON answer.
-            if _requires_nonthinking_response(self.model):
-                payload["reasoning_effort"] = "none"
+            # Prefer the lowest reasoning setting the loaded model advertises.
+            if self._reasoning_effort is not None:
+                payload["reasoning_effort"] = self._reasoning_effort
             if settings.local_llm_structured_output:
                 payload["response_format"] = {
                     "type": "json_schema",
@@ -226,7 +213,15 @@ class LocalDecisionProvider:
                 response = await asyncio.to_thread(self._post, payload)
                 choices = response.get("choices") or []
                 content = choices[0].get("message", {}).get("content", "") if choices else ""
-                decision = _parse_json(content)
+                # Never treat JSON from a reasoning block as the final answer.
+                if isinstance(content, str):
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.S)
+                    if "<think>" in content:
+                        content = ""
+                else:
+                    content = ""
+                finish_reason = choices[0].get("finish_reason") if choices else None
+                decision = _parse_json(content) if finish_reason != "length" else None
                 if decision is not None:
                     telemetry = DecisionTelemetry(
                         trace_id=trace_id,
@@ -240,9 +235,22 @@ class LocalDecisionProvider:
                         prompt_tokens_estimate=prompt_tokens,
                     )
                     return DecisionResponse(decision=decision, telemetry=telemetry)
-                last_error = "Model returned invalid JSON"
+                last_error = (
+                    "Model exhausted LOCAL_LLM_MAX_TOKENS before completing its answer; "
+                    "disable thinking or increase the token budget"
+                    if finish_reason == "length" else
+                    "Model returned no valid JSON decision in its final content"
+                )
             except requests.RequestException as exc:
                 last_error = str(exc)
+                if exc.response is not None:
+                    try:
+                        detail = exc.response.json().get("error", {})
+                        detail = detail.get("message", "") if isinstance(detail, dict) else detail
+                        if detail:
+                            last_error += f": {str(detail)[:500]}"
+                    except (ValueError, AttributeError):
+                        pass
                 logger.warning(
                     "Local decision request %s/%s failed: %s",
                     attempt,
@@ -272,13 +280,41 @@ class LocalDecisionProvider:
 
     @staticmethod
     def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
-        response = requests.post(
-            settings.local_llm_url,
-            json=payload,
-            timeout=settings.local_llm_timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+        payload = dict(payload)
+        deadline = time.monotonic() + settings.local_llm_timeout
+        # Some runtimes reject optional sampling/reasoning or schema fields.
+        # Retry only explicit unsupported-field errors, within the same timeout.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout("LM Studio request exceeded its time budget")
+            response = requests.post(
+                settings.local_llm_url, json=payload, timeout=remaining,
+            )
+            if response.status_code in (400, 422):
+                error = response.text.casefold()
+                unsupported = any(phrase in error for phrase in (
+                    "not supported", "unsupported", "does not support", "unrecognized",
+                    "unknown parameter", "not allowed",
+                ))
+                removable = next((
+                    name for name in ("reasoning_effort", "response_format", "seed", "top_p", "temperature")
+                    if name in payload and (name in error or (
+                        name == "response_format" and "structured output" in error
+                    ))
+                ), None)
+                if unsupported and removable:
+                    payload.pop(removable)
+                    if removable == "response_format":
+                        payload["messages"] = [dict(message) for message in payload["messages"]]
+                        payload["messages"][-1]["content"] += (
+                            "\nReturn only a JSON object matching this schema: "
+                            + json.dumps(DECISION_SCHEMA, separators=(",", ":"))
+                        )
+                    logger.info("LM Studio rejected %s; retrying without that optional field", removable)
+                    continue
+            response.raise_for_status()
+            return response.json()
 
     async def health_check(self) -> Dict[str, Any]:
         base_url = settings.local_llm_url.split("/v1/", 1)[0]
@@ -293,25 +329,17 @@ class LocalDecisionProvider:
             # inference instances and reports the context actually allocated.
             payload = await asyncio.to_thread(_get, f"{base_url}/api/v1/models")
             models = payload.get("models") or []
-            model_info = next(
-                (
-                    item
-                    for item in models
-                    if _local_model_ids_match(
-                        self.configured_model, item.get("key")
-                    )
-                ),
-                None,
-            )
+            model_info, instance, selection_error = select_model(self.configured_model, models)
             if model_info is None:
                 return {
                     "online": True,
                     "available": False,
                     "loaded": False,
                     "selected_model": self.model,
-                    "error": "Configured model is not installed in LM Studio",
+                    "configured_model": self.configured_model,
+                    "error": selection_error,
                 }
-            instances = model_info.get("loaded_instances") or []
+            instances = [instance] if instance is not None else []
             resolved_model = str(
                 (
                     instances[0].get("id")
@@ -321,6 +349,12 @@ class LocalDecisionProvider:
                 or self.configured_model
             )
             self.model = resolved_model
+            if "capabilities" in model_info:
+                self._reasoning_effort = reasoning_effort(model_info)
+            else:
+                self._reasoning_effort = (
+                    "none" if _requires_nonthinking_response(model_info.get("key")) else None
+                )
             instance_config = (instances[0].get("config") or {}) if instances else {}
             loaded_context = instance_config.get("context_length")
             loaded_parallel = instance_config.get("parallel")
@@ -332,9 +366,6 @@ class LocalDecisionProvider:
             loaded_quantization_normalized = str(
                 loaded_quantization or ""
             ).strip().upper()
-            supported_quantizations = _supported_quantizations_for_model(
-                self.configured_model
-            )
             # LM Studio may allocate a larger context window than this client
             # needs.  That is compatible: the configured value is the minimum
             # capacity required by the trading prompts, not an exact runtime
@@ -354,17 +385,10 @@ class LocalDecisionProvider:
                 if required_quantization == LOCAL_LLM_AUTO_QUANTIZATION
                 else "PINNED" if required_quantization else "UNRESTRICTED"
             )
-            if quantization_mode == "FOLLOW_LOADED":
-                quantization_matches = (
-                    loaded_quantization_normalized
-                    in supported_quantizations
-                )
-            else:
-                quantization_matches = (
-                    loaded_quantization_normalized == required_quantization
-                    if required_quantization
-                    else True
-                )
+            quantization_matches = (
+                loaded_quantization_normalized == required_quantization
+                if quantization_mode == "PINNED" else True
+            )
             ready = bool(instances) and context_matches is not False \
                 and parallel_matches is not False and quantization_matches
             result = {
@@ -385,7 +409,8 @@ class LocalDecisionProvider:
                 "quantization": loaded_quantization,
                 "required_quantization": required_quantization or None,
                 "quantization_mode": quantization_mode,
-                "supported_quantizations": list(supported_quantizations),
+                "supported_quantizations": None,
+                "reasoning_effort": self._reasoning_effort,
                 "quantization_matches": quantization_matches,
             }
             if not instances:
@@ -401,48 +426,52 @@ class LocalDecisionProvider:
                     f"the project is configured for {settings.llm_max_concurrency}"
                 )
             elif not quantization_matches:
-                if quantization_mode == "FOLLOW_LOADED":
-                    supported = " or ".join(
-                        supported_quantizations
-                    )
-                    result["error"] = (
-                        "LM Studio loaded quantization is "
-                        f"{loaded_quantization or 'unknown'}, but automatic "
-                        f"switching supports {supported}"
-                    )
-                else:
-                    result["error"] = (
-                        "LM Studio loaded quantization is "
-                        f"{loaded_quantization or 'unknown'}, but the project "
-                        f"requires {required_quantization}"
-                    )
+                result["error"] = (
+                    "LM Studio loaded quantization is "
+                    f"{loaded_quantization or 'unknown'}, but the project "
+                    f"requires {required_quantization}"
+                )
             return result
         except Exception as native_exc:
+            if not isinstance(native_exc, requests.RequestException) or (
+                isinstance(native_exc, requests.HTTPError)
+                and native_exc.response is not None
+                and native_exc.response.status_code not in (404, 405, 501)
+            ):
+                # Malformed metadata or an authorization/server failure must
+                # not silently bypass native context/quantization checks.
+                return {
+                    "online": True,
+                    "available": False,
+                    "loaded": None,
+                    "selected_model": self.model,
+                    "error": f"LM Studio model metadata check failed: {native_exc}",
+                }
             # Older LM Studio releases expose only the OpenAI-compatible model
             # list. That confirms installation but not loaded-instance details.
             try:
                 payload = await asyncio.to_thread(_get, f"{base_url}/v1/models")
-                ids = [item.get("id") for item in payload.get("data", [])]
-                resolved_model = next(
-                    (
-                        model_id
-                        for model_id in ids
-                        if _local_model_ids_match(
-                            self.configured_model, model_id
-                        )
-                    ),
-                    None,
+                model_info, _, selection_error = select_model(
+                    self.configured_model,
+                    [{"key": item.get("id")} for item in payload.get("data", [])],
                 )
+                resolved_model = model_info.get("key") if model_info else None
+                pinned = str(settings.local_llm_required_quantization or "").upper() not in ("", "AUTO")
                 if resolved_model:
                     self.model = str(resolved_model)
                 return {
                     "online": True,
-                    "available": resolved_model is not None,
+                    "available": resolved_model is not None and not pinned,
                     "loaded": None,
                     "selected_model": self.model,
                     "configured_model": self.configured_model,
                     "resolved_model": resolved_model,
                     "configured_context_length": settings.local_llm_context_size,
+                    "error": (
+                        "Cannot verify the pinned quantization with this LM Studio version; "
+                        "use AUTO or enable the native models endpoint"
+                        if pinned else selection_error
+                    ),
                 }
             except Exception as fallback_exc:
                 return {

@@ -260,7 +260,12 @@ class MT5OrderExecutor:
         price, so this is more accurate across JPY pairs and CFDs than a fixed
         pip buffer. The method can only improve an existing stop.
         """
-        requested_floor = max(0.0, float(floor_usd))
+        try:
+            requested_floor = float(floor_usd)
+        except (TypeError, ValueError, OverflowError):
+            requested_floor = float("nan")
+        if not math.isfinite(requested_floor) or requested_floor < 0:
+            return ExecutionResult(False, ticket, None, None, "Invalid net-profit floor")
 
         def _calc():
             positions = mt5.positions_get(ticket=ticket)
@@ -307,14 +312,41 @@ class MT5OrderExecutor:
             if profit_per_pip <= 0:
                 return None, None, "Broker profit-per-pip result is invalid"
 
-            target_gross = execution_cost + requested_floor
+            swap = float(getattr(pos, "swap", 0.0) or 0.0)
+            if not math.isfinite(swap) or not math.isfinite(execution_cost):
+                return None, None, "Invalid profit-lock costs or swap"
+            target_gross = execution_cost + requested_floor - swap
             distance = target_gross / profit_per_pip * one_pip
             lock_sl = (
                 float(pos.price_open) + distance
                 if pos.type == mt5.POSITION_TYPE_BUY
                 else float(pos.price_open) - distance
             )
-            lock_sl = round(lock_sl, int(info.digits))
+            direction = 1 if pos.type == mt5.POSITION_TYPE_BUY else -1
+            rounding = "up" if direction > 0 else "down"
+            step = float(getattr(info, "trade_tick_size", 0.0) or info.point)
+            if not math.isfinite(step) or step <= 0:
+                return None, None, "Invalid profit-lock tick size"
+            # Round toward greater protection, then verify with the broker's
+            # actual P/L calculator. A one-pip linear approximation alone can
+            # understate a floor on coarse ticks or price-dependent conversion.
+            lock_sl = self._normalize_price(lock_sl, info, mode=rounding)
+            for _ in range(3):
+                projected = mt5.order_calc_profit(
+                    order_type, pos.symbol, float(pos.volume),
+                    float(pos.price_open), lock_sl,
+                )
+                if projected is None or not math.isfinite(float(projected)):
+                    return None, None, "Cannot verify net profit at profit-lock SL"
+                deficit = target_gross - float(projected)
+                if deficit <= 1e-8:
+                    break
+                correction = max(step, deficit / profit_per_pip * one_pip)
+                lock_sl = self._normalize_price(
+                    lock_sl + direction * correction, info, mode=rounding
+                )
+            else:
+                return None, None, "Broker-calculated SL profit is below requested floor"
 
             if pos.type == mt5.POSITION_TYPE_BUY:
                 if float(pos.sl or 0.0) > 0 and lock_sl <= float(pos.sl):

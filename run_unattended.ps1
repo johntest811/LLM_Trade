@@ -100,7 +100,7 @@ try {
         @(
             Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                 Where-Object {
-                    $_.Name -match "^python(?:w)?\.exe$" -and
+                    $_.Name -match "^python(?:w)?(?:\d+(?:\.\d+)*)?\.exe$" -and
                     [string]$_.CommandLine -match $entrypointPattern
                 }
         )

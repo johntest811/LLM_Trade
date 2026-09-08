@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app_config.settings import settings
 from core.entry_momentum import aligned_structure_allows_adx_decline
 from risk.execution_costs import estimate_execution_risk
-from risk.instruments import downside_risk_usd, is_crypto_symbol, validate_spread
+from risk.instruments import analysis_atr_price, analysis_is_crypto, downside_risk_usd, is_crypto_symbol, validate_spread
 
 from mt5.safe_api import mt5
 
@@ -461,6 +461,23 @@ class RiskManager:
             f"M5 RSI={rsi:.1f}/{rsi_limit}"
         )
         return allowed, detail
+
+    @staticmethod
+    def _check_minimum_volatility(symbol: str, analysis: Dict[str, Any]) -> Tuple[bool, str]:
+        indicators = analysis.get("indicators") or {}
+        try:
+            if analysis_is_crypto(analysis, symbol):
+                price = float(indicators.get("current_price") or 0.0)
+                atr = analysis_atr_price(analysis)
+                if not math.isfinite(price) or price <= 0 or atr < price * 0.0005:
+                    return False, "REJECTED [Low Volatility]: Crypto ATR is below the minimum 0.05% price threshold or its price is unavailable."
+            else:
+                atr = float(indicators.get("atr_14_pips") or 0.0)
+                if not math.isfinite(atr) or atr < 1.0:
+                    return False, "REJECTED [Low Volatility]: ATR is below the minimum 1.0 pip threshold or is unavailable."
+        except (TypeError, ValueError, OverflowError):
+            return False, "REJECTED [Low Volatility]: ATR or price metadata is invalid."
+        return True, ""
 
     @staticmethod
     def _check_market_shock(
@@ -1259,12 +1276,13 @@ class RiskManager:
         m5_analysis: Optional[Dict[str, Any]],
         trade_history: Optional[List[Dict[str, Any]]],
     ) -> Tuple[bool, str]:
-        """Require genuinely new structure after any same-direction close.
+        """Require a wholly post-close bar and genuinely new structure.
 
-        A profitable close does not make the old thesis new again.  Requiring
-        post-close structure prevents an autonomous strategy from repeatedly
-        reopening the same signal while price and the evidence set are
-        unchanged.
+        A protected winner uses a shorter cooldown than a failed thesis, while
+        both paths still need a new completed-candle trigger.  M5 analysis
+        timestamps identify the candle *open*, so the boundary is aligned to
+        the first full bar after the close instead of adding elapsed minutes to
+        an arbitrary intra-bar broker timestamp.
         """
         ordered = []
         for trade in trade_history or []:
@@ -1293,8 +1311,30 @@ class RiskManager:
         closed_at, pnl, _ = max(same_direction, key=lambda item: item[0])
 
         analysis_time = _parse_utc_datetime((m5_analysis or {}).get("timestamp"))
-        minimum_ready = closed_at + timedelta(
-            minutes=5 * settings.same_thesis_reentry_min_bars
+        bars = (
+            settings.same_thesis_profit_reentry_min_bars
+            if pnl > 0
+            else settings.same_thesis_reentry_min_bars
+        )
+        # A completed analysis stamped 07:30 represents the 07:30-07:35 bar.
+        # For a 07:27:45 close, one wholly post-close bar is therefore the
+        # candle stamped 07:30; two bars are satisfied by the one stamped
+        # 07:35.  The previous close+N*5 calculation delayed each case by an
+        # additional candle.
+        bar_microseconds = 5 * 60 * 1_000_000
+        close_microseconds = int(round(closed_at.timestamp() * 1_000_000))
+        first_post_close_open = (
+            (close_microseconds + bar_microseconds - 1)
+            // bar_microseconds
+            * bar_microseconds
+        )
+        minimum_ready = datetime.fromtimestamp(
+            (
+                first_post_close_open
+                + (max(1, int(bars)) - 1) * bar_microseconds
+            )
+            / 1_000_000,
+            tz=timezone.utc,
         )
         structure = (m5_analysis or {}).get("market_structure", {}) or {}
         expected = {"BUY": "BULLISH", "SELL": "BEARISH"}.get(normalized_action, "")
@@ -1327,21 +1367,29 @@ class RiskManager:
         )
         has_new_range = bool(range_time is not None and range_time > closed_at)
 
-        if (
-            analysis_time is None
-            or analysis_time < minimum_ready
-            or not (new_events or has_new_retest or has_new_range)
-        ):
-            bars = settings.same_thesis_reentry_min_bars
+        has_new_trigger = bool(new_events or has_new_retest or has_new_range)
+        cooldown_pending = bool(
+            analysis_time is None or analysis_time < minimum_ready
+        )
+        if cooldown_pending or not has_new_trigger:
             outcome = "profit" if pnl > 0 else "loss" if pnl < 0 else "flat"
+            if cooldown_pending:
+                requirement = (
+                    f"Wait for at least {bars} completed M5 bars and then require "
+                    "a new directional BOS/CHoCH, verified pullback resumption, "
+                    "or newly qualified range reversal formed after that close."
+                )
+            else:
+                requirement = (
+                    f"The {bars}-bar cooldown has completed, but no new "
+                    "directional BOS/CHoCH, verified pullback resumption, or "
+                    "newly qualified range reversal has formed after that close."
+                )
             return (
                 False,
                 "REJECTED [Same-Thesis Re-entry]: The latest trade in this "
                 f"direction closed with a {outcome} at "
-                f"{closed_at.strftime('%H:%M:%S')} UTC. Wait "
-                f"for at least {bars} completed M5 bars and a new directional "
-                "BOS/CHoCH, verified pullback resumption, or a newly qualified "
-                "range reversal formed after that close.",
+                f"{closed_at.strftime('%H:%M:%S')} UTC. {requirement}",
             )
         return True, ""
 
@@ -1382,7 +1430,7 @@ class RiskManager:
         )
 
         # A weekend is not a reason to lower quality requirements.
-        is_crypto = any(c in symbol.upper() for c in ["ETH", "LTC", "XRP", "BTC"])
+        is_crypto = analysis_is_crypto(m5_analysis or {}, symbol)
         is_weekend_crypto = is_crypto and now_utc.weekday() >= 5
         
         if is_weekend_crypto:
@@ -1610,21 +1658,9 @@ class RiskManager:
 
         # ── 12C. ATR Minimum Volatility ───────────────────────────────
         if m5_analysis:
-            atr = m5_analysis.get("indicators", {}).get("atr_14_pips", 0.0)
-            is_crypto = any(c in symbol.upper() for c in ["ETH", "LTC", "XRP", "BTC"])
-            if is_crypto:
-                price = m5_analysis.get("indicators", {}).get("current_price", 1.0)
-                raw_atr = atr / 100.0 if "XRP" in symbol.upper() else atr
-                min_raw_atr = price * 0.0005  # 0.05% of price
-                if raw_atr < min_raw_atr:
-                    return reject(
-                        f"REJECTED [Low Volatility]: Crypto ATR of {raw_atr:.5f} is below minimum 0.05% price threshold ({min_raw_atr:.5f})."
-                    )
-            else:
-                if atr < 1.0:
-                    return reject(
-                        f"REJECTED [Low Volatility]: ATR of {atr:.2f} pips is below minimum 1.0 pip threshold."
-                    )
+            volatility_ok, volatility_reason = self._check_minimum_volatility(symbol, m5_analysis)
+            if not volatility_ok:
+                return reject(volatility_reason)
 
         # ── 12D. Ranging Market Filter ────────────────────────────────
         if m5_analysis:
@@ -1633,7 +1669,6 @@ class RiskManager:
             if not shock_ok:
                 return reject(shock_reason)
             adx = indicators.get("adx_14", 0.0)
-            is_crypto = any(c in symbol.upper() for c in ["ETH", "LTC", "XRP", "BTC"])
             min_adx = settings.entry_min_adx
             if adx < min_adx and strategy_mode != "RANGE_REVERSION":
                 return reject(

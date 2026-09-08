@@ -50,7 +50,10 @@ strategy's expectancy.
 - Reads live ticks and completed candles from the active Pepperstone MT5
   terminal.
 - Starts a decision once per newly completed **M5** candle and uses **M15, H1,
-  and H4** for confirmation.
+  and H4** for confirmation. The unfinished M5 bar is deliberately excluded;
+  it can change before close. Same-thesis re-entry waits for one wholly
+  post-close M5 bar after a protected winner and two after a loss/flat close,
+  and still requires a new structure, retest, or range-reversal trigger.
 - Sends indicators and market structure to the configured decision provider.
   The deterministic provider may return `BUY`, `SELL`, or `HOLD`; optional
   model providers may also propose an exit-only `CLOSE`. No provider can choose
@@ -78,9 +81,12 @@ strategy's expectancy.
   broker-reported floating P/L, and manages profit in original-risk (R) units.
   The first broker profit floor requires both +$0.35 estimated net and +0.50R
   before protecting +$0.08. At +$0.60 and +0.75R it protects 35% of current
-  net profit, and at +$1.15 it attempts to protect +$1.00. Break-even remains
-  at +0.75R, trailing starts at +1.00R, and stagnant setups retire after 12 M5
-  bars.
+  net profit. At both +$1.15 and +0.60R, a hybrid tier protects the smaller of
+  +$1.00 or +0.55R; after +1.25R it protects at least +0.70R using immutable
+  initial risk (about $0.98 for a $1.40-risk trade). If the risk baseline is
+  unavailable, +$1.15 to +$1.00 remains the bounded recovery fallback. Normal
+  bot trades use a 1.00R trailing distance after +1.00R. Break-even remains at
+  +0.75R, and stagnant setups retire after 12 M5 bars.
 - Runs deterministic analysis across the active market universe, then sends
   only the configured number of top-ranked, capital-fit setups to the serial
   local-model queue (three on the desktop profile, two on the 4 GB laptop).
@@ -284,14 +290,50 @@ outage.
 - Profit peaks are account-and-ticket scoped and persisted. A restart therefore
   cannot erase the fact that a still-open trade previously crossed the
   configured profit-protection trigger.
-- Profit locks use current cost-adjusted profit, not a past peak. The first two
-  tiers require their USD and R thresholds simultaneously; the final +$1.15
-  tier can still attempt its +$1.00 floor if a restart cannot reconstruct R.
+- Broker history reports every activated stop as a stop-loss event. The
+  terminal labels a stop-triggered exit with positive net P/L as
+  `PROTECTIVE_STOP`, distinguishing a successful profit floor or trailing stop
+  from an initial losing `STOP_LOSS` without rewriting the broker record.
+- Early profit locks use current cost-adjusted profit, not a past peak. The first two
+  tiers require their USD and R thresholds simultaneously. The +$1.15 tier
+  also requires +0.60R and caps its floor at +0.55R, so it can attempt +$1.00
+  without becoming oversized for a small-risk trade. A mature +1.25R trade
+  receives a scale-aware +0.70R minimum floor. If a restart cannot reconstruct
+  R, the +$1.15 to +$1.00 rule remains the bounded fallback.
   Successful tiers are remembered per ticket so later tiers can upgrade the
   broker stop without repeating the same modification every poll. An ordinary
   giveback cannot market-close a position with a valid risk baseline until its
   peak reaches 1R by default; completed-M1 adverse-structure management and the
   broker stop remain active below that threshold.
+  Mature **net-profit retention** additionally arms at an observed $1.50 net
+  peak and 1.00R of initial monetary risk (when available). It requests at least
+  a $1.00 floor, ratcheting to 65% of the net peak and 75% once the net peak
+  reaches 2.00R. For $1.40 initial risk, $1.65 **net** requests a $1.07 floor;
+  $2.80 net requests $2.10. It does not cap a continuing winner's profit or
+  extend the technical TP. Tighter retention can also exit a recoverable pullback.
+  The desired floor never decreases at unchanged size and survives restarts
+  in account/ticket-scoped storage. Partial closes scale it to remaining size;
+  adding volume resets the monetary baseline without loosening the broker SL.
+  Net estimates include configured round-turn costs and current swap. The
+  executor rounds toward protection on the broker tick grid and verifies the
+  projected net P/L before requesting the SL. The UI separately reports the
+  accepted broker floor estimate and desired net-retention floor. If net falls
+  through the desired floor, the existing `PROFIT_GIVEBACK_ENABLED` switch also
+  enables the software `PROFIT_RETENTION` exit, even if broker stop/freeze
+  restrictions prevented the SL upgrade. This fallback requires the application
+  and broker connection to remain running; gaps, slippage, unobserved peaks and
+  differences between estimated and actual costs mean no realized $1 guarantee.
+  Configure `PROFIT_RETENTION_ENABLED`, `PROFIT_RETENTION_TRIGGER_USD`,
+  `PROFIT_RETENTION_TRIGGER_R`, `PROFIT_RETENTION_KEEP_FRACTION`,
+  `PROFIT_RETENTION_MATURE_TRIGGER_R`, `PROFIT_RETENTION_MATURE_KEEP_FRACTION`,
+  and `PROFIT_RETENTION_MIN_HEADROOM_USD` in `.env`, then restart the process.
+  `PROFIT_LOCK_ENABLED=false` disables this additional retention layer too.
+  Application-led closes also persist their exact strategy cause separately
+  from MT5's generic `EXPERT` label, so broker reconciliation and restarts do
+  not erase `PROFIT_GIVEBACK`, reversal, stagnation, model, or operator exits.
+  Those exits are replayed diagnostically at 15/30/60 minutes against the
+  original broker SL/TP. The UI reports hold-minus-actual R results, but this
+  evidence never changes live rules automatically.
 - An exhausted same-candle M5 BOS/breakout must also have a verified retest, a
   directional candle pattern, or an actual H1/H4 structure event. Higher-
   timeframe direction labels alone cannot authorize that chased setup.
@@ -392,22 +434,99 @@ ASK and a SELL opens at BID. Spread calculations always use `ask - bid`.
 
 ## Optional LM Studio guidance
 
+The local provider accepts any chat LLM served by LM Studio, with no publisher,
+model-family, or quantization allow-list. Set `LLM_PROVIDER=local`, copy the
+model's exact API identifier to `LOCAL_LLM_MODEL`, and keep
+`LOCAL_LLM_REQUIRED_QUANTIZATION=AUTO`. For example, all of these are valid:
+
+- `prism-ml/bonsai-27b`
+- `qwen3.5-4b@q4_k_s`
+- `qwen3.5-4b@iq4_xs`
+- Any other installed chat model's catalog key or custom loaded instance ID.
+
+Use literal `@` and `_` characters in `.env`, without Markdown backslashes.
+An explicit `@variant` selects that variant only. An unsuffixed name can resolve
+to its loaded variant; ambiguous names report an error instead of selecting an
+unrelated model. `AUTO` accepts all quantizations, including models whose runtime
+does not report one. Enter an exact quantization name in settings or `.env` to
+enforce a pin.
+
+Load the selected model in LM Studio with at least `LOCAL_LLM_CONTEXT_SIZE`
+tokens and enough parallel slots for `LLM_MAX_CONCURRENCY`. Restart the terminal
+after changing `.env`. Test it independently of the trading engine with:
+
+```powershell
+python -m llm.check
+python -m llm.check --model "qwen3.5-4b@iq4_xs"
+```
+
+This sends a HOLD-only readiness request and exits with code 0 when successful.
+It does not load models or place trades. Embedding models cannot serve chat
+decisions. Model support does not guarantee valid JSON or adequate speed on
+every machine: loading, context, timeout, and decision-validation checks still
+apply. A runtime rejecting an optional request field gets a bounded compatibility
+retry; unsupported structured output falls back to a JSON instruction. Invalid
+or truncated output remains a failed decision.
+
 For an RTX 3060 12 GB, Qwen3.5 9B Q6 remains an optional higher-capacity local
 profile; Q8 consumes more VRAM and does not improve deterministic price, risk,
 or broker validation. The active low-latency profile now uses Qwen3.5 4B. For
 the 4 GB RTX 2050 laptop, use its Q4_K_M build as described above. A model that
 spills heavily into system RAM can let a decision become stale before execution.
 
-- Leave **Enable Thinking** and **Preserve Thinking** off for the automated M5
-  loop. Supported Qwen3.5 and `prism-ml/bonsai-27b` requests also send LM Studio
-  `reasoning_effort=none`, preventing hidden reasoning from consuming the
-  bounded 220-token decision response before JSON is produced. Bonsai's native
-  Q1_0 quantization is accepted only for that named model; Q1_0 remains blocked
-  for ordinary local models.
+- The provider uses LM Studio's advertised reasoning capabilities to turn
+  thinking off when available, or request the lowest advertised effort.
+  Reasoning-only models may need a larger `LOCAL_LLM_MAX_TOKENS` than the default
+  220 (up to 32768 can be configured), plus enough loaded context. The engine's
+  existing time and freshness limits still apply.
 - Turn LM Studio's global **Structured Output** toggle off if its schema box is
   empty. Keep `LOCAL_LLM_STRUCTURED_OUTPUT=True`; the application sends its own
   strict schema with each request.
 - Temperature is `0.0` for repeatability.
+
+## Opportunity scanning and broker-wide discovery
+
+Discovery and entry now share completed M5/M15/H1/H4 analysis. Eligible range
+reversals and verified pullback resumptions join fresh BOS/CHoCH and breakout
+setups. Retests are reconstructed from adjacent closed M5 candles, even for a
+newly discovered market; session gaps do not create retests.
+
+Verified, affordable setups receive active-watch priority before markets still
+waiting for a trigger. The existing deterministic structure/exhaustion checks
+run before model admission, so an impossible setup does not consume a model
+slot. Remaining candidates can use unused slots even if an older ranking put
+them below the model cutoff. Actual confidence, exposure, spread, margin,
+freshness, broker permissions, and final execution checks are unchanged. The
+60% failed-thesis exception is still conditional, not a general confidence floor.
+
+Optional `.env` settings (restart required):
+
+```dotenv
+DYNAMIC_MARKET_SELECTION_ENABLED=true
+BROKER_MARKET_DISCOVERY_ENABLED=true
+BROKER_MARKET_GROUP=*
+BROKER_MARKET_BATCH_SIZE=12
+BROKER_MARKET_REFRESH_SECONDS=300
+```
+
+Configured and currently selected markets are revisited each selection cycle.
+Up to 12 additional broker instruments rotate into each assessment batch;
+visible Market Watch contracts are ordered first on the initial pass. The
+broker catalog refreshes every 300 seconds. This bounds analysis load: it does
+not scan thousands of instruments every minute or increase the per-bar model
+budget. Large catalogs take multiple cycles to cover. Use `BROKER_MARKET_GROUP`
+to narrow coverage with the broker's symbol-name wildcard filters, as described
+in [MT5 symbols_get](https://www.mql5.com/en/docs/python_metatrader5/mt5symbolsget_py).
+The existing configured weekend-only universe remains in effect.
+
+Discovery excludes custom, disabled, close-only, ambiguous-name and unusable
+contracts, including contracts without market orders and broker SL/TP support.
+Exact broker symbol casing and broker pip metadata are retained across market
+data and execution. A listed contract can still be unavailable because of its
+session, missing history, spread, account size, or risk limits. Dashboard market
+cards show setup readiness, viable directions, and technical rejection reasons
+separately from affordability. These changes increase coverage and review
+efficiency, not guaranteed fills, win rate, or profitability.
 
 ## Before considering live arming
 

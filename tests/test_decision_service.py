@@ -346,6 +346,90 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["parallel_matches"])
         self.assertTrue(result["quantization_matches"])
 
+    async def test_qwen35_4b_requested_quantized_ids_are_ready(self):
+        for model_id, quantization in (
+            ("qwen3.5-4b@q4_k_s", "Q4_K_S"),
+            ("qwen3.5-4b@iq4_xs", "IQ4_XS"),
+        ):
+            with self.subTest(model_id=model_id):
+                api_response = Mock()
+                api_response.raise_for_status.return_value = None
+                api_response.json.return_value = {
+                    "models": [
+                        {
+                            "key": model_id,
+                            "quantization": {"name": quantization},
+                            "loaded_instances": [
+                                {
+                                    "id": model_id,
+                                    "config": {
+                                        "context_length": 8192,
+                                        "parallel": 1,
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                }
+                local_settings = SimpleNamespace(
+                    local_llm_model=model_id,
+                    local_llm_url=(
+                        "http://127.0.0.1:1234/v1/chat/completions"
+                    ),
+                    local_llm_context_size=4096,
+                    local_llm_required_quantization="AUTO",
+                    llm_max_concurrency=1,
+                )
+
+                with patch("llm.client.settings", local_settings):
+                    provider = LocalDecisionProvider()
+                    with patch(
+                        "llm.client.requests.get", return_value=api_response
+                    ):
+                        result = await provider.health_check()
+
+                self.assertTrue(result["available"])
+                self.assertEqual(result["resolved_model"], model_id)
+                self.assertTrue(result["quantization_matches"])
+                self.assertIsNone(result["supported_quantizations"])
+
+    async def test_qwen35_quantized_catalog_alias_resolves_publisher_prefix(self):
+        model_id = "qwen3.5-4b@iq4_xs"
+        api_response = Mock()
+        api_response.raise_for_status.return_value = None
+        api_response.json.return_value = {
+            "models": [
+                {
+                    "key": model_id,
+                    "quantization": {"name": "IQ4_XS"},
+                    "loaded_instances": [
+                        {
+                            "id": model_id,
+                            "config": {
+                                "context_length": 4096,
+                                "parallel": 1,
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        local_settings = SimpleNamespace(
+            local_llm_model="qwen/qwen3.5-4b@iq4_xs",
+            local_llm_url="http://127.0.0.1:1234/v1/chat/completions",
+            local_llm_context_size=4096,
+            local_llm_required_quantization="AUTO",
+            llm_max_concurrency=1,
+        )
+
+        with patch("llm.client.settings", local_settings):
+            provider = LocalDecisionProvider()
+            with patch("llm.client.requests.get", return_value=api_response):
+                result = await provider.health_check()
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["resolved_model"], model_id)
+
     async def test_bonsai_request_disables_thinking_and_uses_strict_schema(self):
         local_settings = SimpleNamespace(
             local_llm_model="prism-ml/bonsai-27b",
@@ -426,9 +510,9 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["resolved_model"], "prism-ml/bonsai-27b")
         self.assertEqual(result["quantization"], "Q1_0")
         self.assertTrue(result["quantization_matches"])
-        self.assertIn("Q1_0", result["supported_quantizations"])
+        self.assertIsNone(result["supported_quantizations"])
 
-    async def test_non_bonsai_auto_profile_still_rejects_q1(self):
+    async def test_any_model_auto_profile_accepts_q1(self):
         api_response = Mock()
         api_response.raise_for_status.return_value = None
         api_response.json.return_value = {
@@ -458,9 +542,9 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
             with patch("llm.client.requests.get", return_value=api_response):
                 result = await provider.health_check()
 
-        self.assertFalse(result["available"])
-        self.assertFalse(result["quantization_matches"])
-        self.assertNotIn("Q1_0", result["supported_quantizations"])
+        self.assertTrue(result["available"])
+        self.assertTrue(result["quantization_matches"])
+        self.assertIsNone(result["supported_quantizations"])
 
     async def test_native_health_reports_loaded_context_and_quantization(self):
         api_response = Mock()
@@ -601,7 +685,7 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["loaded_context_length"], 10240)
 
     async def test_native_health_auto_profile_accepts_supported_variants(self):
-        for quantization in ("Q4_K_M", "Q6_K", "Q8_0"):
+        for quantization in ("Q4_K_M", "Q6_K", "Q8_0", "IQ4_XS", "F16", "BF16", "NEW_QUANT", None):
             with self.subTest(quantization=quantization):
                 api_response = Mock()
                 api_response.raise_for_status.return_value = None
@@ -644,12 +728,9 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     result["quantization_mode"], "FOLLOW_LOADED"
                 )
-                self.assertEqual(
-                    result["supported_quantizations"],
-                    ["Q4_K_M", "Q6_K", "Q8_0"],
-                )
+                self.assertIsNone(result["supported_quantizations"])
 
-    async def test_native_health_auto_profile_rejects_other_quantization(self):
+    async def test_native_health_auto_profile_accepts_other_quantization(self):
         api_response = Mock()
         api_response.raise_for_status.return_value = None
         api_response.json.return_value = {
@@ -681,9 +762,9 @@ class LocalDecisionProviderHealthTests(unittest.IsolatedAsyncioTestCase):
             with patch("llm.client.requests.get", return_value=api_response):
                 result = await provider.health_check()
 
-        self.assertFalse(result["available"])
-        self.assertFalse(result["quantization_matches"])
-        self.assertIn("supports Q4_K_M or Q6_K or Q8_0", result["error"])
+        self.assertTrue(result["available"])
+        self.assertTrue(result["quantization_matches"])
+        self.assertNotIn("error", result)
 
 
 class LLMClientReadinessTests(unittest.IsolatedAsyncioTestCase):

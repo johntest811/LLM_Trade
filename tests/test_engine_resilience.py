@@ -499,6 +499,7 @@ class EngineResilienceTests(unittest.TestCase):
             settings,
             profit_lock_final_trigger_usd=1.15,
             profit_lock_final_floor_usd=1.00,
+            profit_lock_final_fallback_only=True,
         )
         with patch("core.engine.settings", protection_settings):
             self.assertEqual(
@@ -510,7 +511,110 @@ class EngineResilienceTests(unittest.TestCase):
                 (1.00, "final"),
             )
 
-    def test_profit_lock_can_upgrade_from_first_to_final_tier(self):
+    def test_mature_profit_lock_scales_with_immutable_initial_risk(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_mature_trigger_r=1.25,
+            profit_lock_mature_floor_r=0.70,
+            profit_lock_final_fallback_only=True,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=1.25,
+                    estimated_net_profit_usd=1.84,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.40,
+                ),
+                (0.98, "mature 0.70R"),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=1.24,
+                    estimated_net_profit_usd=1.84,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.40,
+                ),
+                (0.64, "35%"),
+            )
+
+    def test_mature_profit_lock_keeps_execution_headroom(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_mature_trigger_r=1.25,
+            profit_lock_mature_floor_r=0.70,
+            profit_lock_final_fallback_only=True,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=1.25,
+                    estimated_net_profit_usd=0.50,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.00,
+                ),
+                (0.40, "mature 0.70R"),
+            )
+
+    def test_hybrid_one_dollar_lock_is_bounded_by_initial_risk(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_final_trigger_usd=1.15,
+            profit_lock_final_trigger_r=0.60,
+            profit_lock_final_floor_usd=1.00,
+            profit_lock_final_max_floor_r=0.55,
+            profit_lock_final_fallback_only=False,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.63,
+                    estimated_net_profit_usd=1.20,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.83,
+                ),
+                (1.00, "hybrid $1"),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.82,
+                    estimated_net_profit_usd=1.20,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.40,
+                ),
+                (0.77, "hybrid $1"),
+            )
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=0.59,
+                    estimated_net_profit_usd=1.20,
+                    has_r_baseline=True,
+                    initial_risk_usd=1.83,
+                ),
+                (0.08, "first"),
+            )
+
+    def test_fixed_final_tier_does_not_override_r_based_protection(self):
+        protection_settings = replace(
+            settings,
+            profit_lock_mid_trigger_r=0.75,
+            profit_lock_mid_trigger_usd=0.60,
+            profit_lock_mid_fraction=0.35,
+            profit_lock_final_trigger_usd=1.15,
+            profit_lock_final_floor_usd=1.00,
+            profit_lock_final_fallback_only=True,
+        )
+        with patch("core.engine.settings", protection_settings):
+            self.assertEqual(
+                TradingEngine._profit_lock_target(
+                    live_r=1.00,
+                    estimated_net_profit_usd=1.15,
+                    has_r_baseline=True,
+                ),
+                (0.40, "35%"),
+            )
+
+    def test_profit_lock_can_upgrade_to_legacy_final_tier_when_enabled(self):
         engine = TradingEngine.__new__(TradingEngine)
         engine.executor = SimpleNamespace(
             close_position=AsyncMock(),
@@ -555,6 +659,7 @@ class EngineResilienceTests(unittest.TestCase):
             profit_lock_mid_fraction=0.35,
             profit_lock_final_trigger_usd=1.15,
             profit_lock_final_floor_usd=1.00,
+            profit_lock_final_fallback_only=False,
             position_stagnation_exit_enabled=False,
             breakeven_trigger_r=10.0,
             trailing_trigger_r=10.0,

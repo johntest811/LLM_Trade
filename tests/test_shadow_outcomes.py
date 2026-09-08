@@ -3,7 +3,10 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from core.shadow_outcomes import evaluate_shadow_candidate
+from core.shadow_outcomes import (
+    evaluate_exit_counterfactual,
+    evaluate_shadow_candidate,
+)
 from database.replay_logger import TradeReplayLogger
 
 
@@ -74,6 +77,57 @@ def test_timeout_uses_directional_close_return():
     assert round(result.outcome_r or 0.0, 3) == 0.5
 
 
+def test_exit_counterfactual_uses_only_wholly_post_exit_bars():
+    exited = datetime(2026, 8, 3, 10, 0, 30, tzinfo=timezone.utc)
+    candidate = {
+        "action": "BUY",
+        "entry": 1.1000,
+        "stop_loss": 1.0990,
+        "take_profit": 1.1020,
+        "actual_exit_price": 1.1005,
+        "realized_r": 0.40,
+        "exit_time_utc": exited.isoformat(),
+        "horizon_minutes": 15,
+    }
+    bars = [
+        # This bar contains pre-exit price path and must be ignored.
+        {"time": "2026-08-03T10:00:00Z", "high": 1.1021, "low": 1.0998, "close": 1.1019},
+        {"time": "2026-08-03T10:15:00Z", "high": 1.1012, "low": 1.1002, "close": 1.1010},
+    ]
+
+    result = evaluate_exit_counterfactual(
+        candidate, bars, now_utc=exited + timedelta(minutes=16)
+    )
+
+    assert result is not None
+    assert result.status == "HORIZON"
+    assert result.outcome_r == pytest.approx(1.0)
+    assert result.delta_vs_realized_r == pytest.approx(0.6)
+
+
+def test_exit_counterfactual_records_target_reached_after_exit():
+    candidate = {
+        "action": "SELL",
+        "entry": 181.200,
+        "stop_loss": 181.500,
+        "take_profit": 180.660,
+        "actual_exit_price": 181.100,
+        "realized_r": 0.30,
+        "exit_time_utc": "2026-08-03T10:00:30Z",
+        "horizon_minutes": 30,
+    }
+    bars = [
+        {"time": "2026-08-03T10:01:00Z", "high": 181.15, "low": 180.65, "close": 180.70},
+    ]
+
+    result = evaluate_exit_counterfactual(candidate, bars)
+
+    assert result is not None
+    assert result.status == "TARGET_AFTER_EXIT"
+    assert result.outcome_r == pytest.approx(1.8)
+    assert result.delta_vs_realized_r == pytest.approx(1.5)
+
+
 def test_replay_logger_deduplicates_and_summarizes_shadow_rows(tmp_path):
     logger = TradeReplayLogger(str(tmp_path / "shadow.db"))
     values = {
@@ -115,6 +169,55 @@ def test_replay_logger_deduplicates_and_summarizes_shadow_rows(tmp_path):
         "losses": 0,
         "expectancy_r": 2.0,
     }
+
+
+def test_replay_logger_deduplicates_exit_counterfactuals(tmp_path):
+    logger = TradeReplayLogger(str(tmp_path / "exit-shadow.db"))
+    plan = {
+        "entry": 1.1000,
+        "stop_loss": 1.0990,
+        "take_profit": 1.1020,
+        "confidence": 0.80,
+    }
+    logger.log_replay_attempt(
+        "EURUSD", "BUY", "", plan, {}, {}, 80.0, 70.0,
+        "OPEN", ticket=202,
+    )
+    closed_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    trade = {
+        "position_id": 202,
+        "symbol": "EURUSD",
+        "direction": "BUY",
+        "open_price": 1.1000,
+        "close_price": 1.1005,
+        "close_time": closed_at,
+        "close_reason": "PROFIT_GIVEBACK",
+        "rr_achieved": 0.40,
+    }
+
+    assert logger.log_exit_candidates(
+        account_login=1001, trades=[trade], horizons_minutes=[15, 30]
+    ) == 2
+    assert logger.log_exit_candidates(
+        account_login=1001, trades=[trade], horizons_minutes=[15, 30]
+    ) == 0
+    pending = logger.get_pending_exit_candidates()
+    assert len(pending) == 2
+    assert logger.resolve_exit_candidate(
+        pending[0]["id"],
+        status="HORIZON",
+        resolved_at_utc=datetime.now(timezone.utc).isoformat(),
+        exit_price=1.1010,
+        outcome_r=1.0,
+        delta_vs_realized_r=0.6,
+        post_exit_mfe_r=1.2,
+        post_exit_mae_r=0.3,
+    )
+    summary = logger.exit_counterfactual_summary()
+    assert summary["exit_pending"] == 1
+    assert summary["exit_resolved"] == 1
+    assert summary["exit_held_better"] == 1
+    assert summary["exit_average_delta_r"] == 0.6
 
 
 def test_shadow_summary_exposes_symmetric_direction_funnel(tmp_path):

@@ -50,6 +50,12 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn('id="trade-tp-estimate"', self.html)
         self.assertIn("function updateProtectionEstimates()", self.js)
 
+    def test_profit_floor_display_separates_accepted_stop_and_retention_target(self):
+        self.assertIn("BROKER FLOOR", self.js)
+        self.assertIn("NET RETENTION", self.js)
+        self.assertIn("position.profit_lock_floor_usd", self.js)
+        self.assertIn("position.profit_retention_floor_usd", self.js)
+
     def test_minimum_risk_reward_supports_hundredths(self):
         self.assertIn('$("c-rr").step = "0.01"', self.js)
         self.assertIn(
@@ -120,7 +126,9 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn('id="shadow-summary"', self.html)
         self.assertIn('id="shadow-gates"', self.html)
         self.assertIn('id="shadow-directions"', self.html)
+        self.assertIn('id="exit-counterfactual"', self.html)
         self.assertIn("direction funnel", self.js)
+        self.assertIn("Post-exit original-bracket replay", self.js)
         self.assertIn("function renderShadowEvidence", self.js)
         self.assertIn("Diagnostic only", self.js)
         self.assertIn("Last ${windowHours}h gate outcomes", self.js)

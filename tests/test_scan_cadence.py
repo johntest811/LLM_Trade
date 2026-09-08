@@ -369,6 +369,53 @@ class ScanCadenceTests(unittest.TestCase):
             )
         )
 
+    def test_exhausted_bos_uses_neither_model_calls_nor_admission_slots(self):
+        class ExhaustedAnalyzer(_Analyzer):
+            def analyze(self, symbol, timeframe, candles):
+                result = super().analyze(symbol, timeframe, candles)
+                result["timestamp"] = "2026-08-12 05:10:00+00:00"
+                result["market_structure"].update(
+                    trend_state="CONFIRMED_BEARISH", trend_state_direction="BEARISH",
+                    breakout_status="BEARISH BREAKOUT" if timeframe == "M5" else "NONE",
+                )
+                if timeframe != "M5":
+                    result["market_structure"]["structure_events"] = []
+                result["indicators"].update(
+                    rsi_14=25.0, stochastic={"k": 1.0, "d": 1.0},
+                    current_price=100.0, atr_14=1.0,
+                    bollinger_bands={"lower": 99.0, "upper": 101.0},
+                )
+                return result
+
+        llm = _LLM()
+        engine = TradingEngine(object(), _Reader(), object(), llm, _Database(), object())
+        engine.analyzer = ExhaustedAnalyzer()
+        engine.log = lambda *args, **kwargs: None
+        with (
+            patch("core.engine.is_weekend", return_value=False),
+            patch("core.engine.DeterministicTradePlanner.assess_capital_fit", return_value={"capital_fit": True}),
+            patch("core.engine.dashboard_state.update_symbol_decision") as update_decision,
+        ):
+            asyncio.run(engine._evaluate_symbol("USDJPY", {"balance": 15.0}, []))
+        self.assertEqual(llm.calls, 0)
+        self.assertFalse(engine._entry_model_admissions)
+        self.assertTrue(any(call.kwargs.get("stage") == "SETUP FILTERED" for call in update_decision.call_args_list))
+
+    def test_older_ranking_cannot_veto_a_fresh_setup_with_unused_capacity(self):
+        llm = _LLM()
+        engine = TradingEngine(object(), _Reader(), object(), llm, _Database(), object())
+        engine.analyzer = _Analyzer()
+        engine.entries_armed = False
+        engine.log = lambda *args, **kwargs: None
+        engine._market_rankings["USDJPY"] = {"model_selection_rank": 20, "model_eligible": False}
+        with (
+            patch("core.engine.is_weekend", return_value=False),
+            patch("core.engine.DeterministicTradePlanner.assess_capital_fit", return_value={"capital_fit": True}),
+            patch("core.engine.PromptGenerator.generate", return_value=("system", "user")),
+        ):
+            asyncio.run(engine._evaluate_symbol("USDJPY", {"balance": 15.0}, []))
+        self.assertEqual(llm.calls, 1)
+
     def test_entry_prefilter_ignores_small_adx_measurement_noise(self):
         reason = TradingEngine._entry_prefilter_reason(
             {"indicators": {"adx_14": 25.0, "adx_delta": -0.25}}

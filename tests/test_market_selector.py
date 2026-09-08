@@ -376,6 +376,7 @@ class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_ranks_open_markets_independently_of_capital_fit(self):
         isolated = replace(
             settings,
+            broker_market_discovery_enabled=False,
             dynamic_market_selection_enabled=True,
             trading_symbols=["USDJPY"],
             market_candidate_symbols=["USDJPY", "USDCAD", "CADJPY"],
@@ -418,6 +419,7 @@ class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_from_superseded_account_cannot_replace_selection(self):
         isolated = replace(
             settings,
+            broker_market_discovery_enabled=False,
             dynamic_market_selection_enabled=True,
             trading_symbols=["USDJPY"],
             market_candidate_symbols=["USDJPY", "USDCAD"],

@@ -148,6 +148,35 @@ class TradeReplayLogger:
                 CREATE INDEX IF NOT EXISTS idx_shadow_outcome_status_time
                 ON shadow_outcome(status, created_at_utc)
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS exit_counterfactual (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_login INTEGER NOT NULL,
+                    ticket INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    exit_reason TEXT NOT NULL,
+                    exit_time_utc TEXT NOT NULL,
+                    entry REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    actual_exit_price REAL NOT NULL,
+                    realized_r REAL NOT NULL,
+                    horizon_minutes REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    resolved_at_utc TEXT,
+                    counterfactual_exit_price REAL,
+                    outcome_r REAL,
+                    delta_vs_realized_r REAL,
+                    post_exit_mfe_r REAL,
+                    post_exit_mae_r REAL,
+                    UNIQUE(account_login, ticket, horizon_minutes)
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_exit_counterfactual_status_time
+                ON exit_counterfactual(status, exit_time_utc)
+            """)
             conn.commit()
         except Exception as e:
             logger.error(f"Error initializing trade_replay table: {e}")
@@ -275,6 +304,220 @@ class TradeReplayLogger:
         except Exception as exc:
             logger.error("Error resolving shadow candidate: %s", exc)
             return False
+
+    def log_exit_candidates(
+        self,
+        *,
+        account_login: int,
+        trades: List[Dict[str, Any]],
+        horizons_minutes: List[int],
+    ) -> int:
+        """Queue diagnostic original-SL/TP hold comparisons in one transaction."""
+        generic_or_broker = {
+            "", "CLIENT", "MOBILE", "WEB", "EXPERT", "OTHER", "UNKNOWN",
+            "SIGNAL", "STOP_LOSS", "TAKE_PROFIT", "STOP_OUT",
+        }
+        eligible = [
+            trade for trade in trades
+            if str(trade.get("close_reason", "")).strip().upper()
+            not in generic_or_broker
+        ]
+        horizons = sorted({max(5, int(value)) for value in horizons_minutes})
+        if int(account_login) <= 0 or not eligible or not horizons:
+            return 0
+        try:
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=10000")
+                tickets = sorted({int(row.get("position_id", 0) or 0) for row in eligible})
+                placeholders = ",".join("?" for _ in tickets)
+                replay_rows = conn.execute(
+                    f"""
+                    SELECT id, ticket, stop_loss, take_profit
+                    FROM trade_replay
+                    WHERE ticket IN ({placeholders})
+                    ORDER BY id DESC
+                    """,
+                    tickets,
+                ).fetchall()
+                plans: Dict[int, sqlite3.Row] = {}
+                for replay in replay_rows:
+                    plans.setdefault(int(replay["ticket"] or 0), replay)
+
+                inserts = []
+                now = datetime.now(timezone.utc)
+                max_horizon = max(horizons)
+                for trade in eligible:
+                    ticket = int(trade.get("position_id", 0) or 0)
+                    plan = plans.get(ticket)
+                    if plan is None:
+                        continue
+                    try:
+                        exit_time = datetime.fromisoformat(
+                            str(trade.get("close_time", "")).replace("Z", "+00:00")
+                        )
+                        if exit_time.tzinfo is None:
+                            exit_time = exit_time.replace(tzinfo=timezone.utc)
+                        else:
+                            exit_time = exit_time.astimezone(timezone.utc)
+                        # The M1 reader keeps a bounded recent window. Do not
+                        # create permanently pending rows for old history.
+                        if now - exit_time > timedelta(minutes=max_horizon + 120):
+                            continue
+                        entry = float(trade.get("open_price", 0.0) or 0.0)
+                        stop = float(plan["stop_loss"] or 0.0)
+                        target = float(plan["take_profit"] or 0.0)
+                        actual_exit = float(trade.get("close_price", 0.0) or 0.0)
+                        realized_r = float(trade.get("rr_achieved", 0.0) or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if min(entry, stop, target, actual_exit) <= 0 or entry == stop:
+                        continue
+                    for horizon in horizons:
+                        inserts.append((
+                            int(account_login), ticket,
+                            str(trade.get("symbol", "")).upper(),
+                            str(trade.get("direction", "")).upper(),
+                            str(trade.get("close_reason", "")).upper(),
+                            exit_time.isoformat(), entry, stop, target,
+                            actual_exit, realized_r, float(horizon),
+                        ))
+                if not inserts:
+                    return 0
+                before = conn.total_changes
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO exit_counterfactual (
+                        account_login, ticket, symbol, action, exit_reason,
+                        exit_time_utc, entry, stop_loss, take_profit,
+                        actual_exit_price, realized_r, horizon_minutes, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                    """,
+                    inserts,
+                )
+                conn.commit()
+                return conn.total_changes - before
+        except Exception as exc:
+            logger.error("Error logging exit counterfactuals: %s", exc)
+            return 0
+
+    def get_pending_exit_candidates(self, limit: int = 100) -> List[Dict[str, Any]]:
+        try:
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=10000")
+                rows = conn.execute(
+                    """
+                    SELECT * FROM exit_counterfactual
+                    WHERE status='PENDING'
+                    ORDER BY exit_time_utc ASC, horizon_minutes ASC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            logger.error("Error reading exit counterfactuals: %s", exc)
+            return []
+
+    def resolve_exit_candidate(
+        self,
+        candidate_id: int,
+        *,
+        status: str,
+        resolved_at_utc: str,
+        exit_price: float,
+        outcome_r: Optional[float],
+        delta_vs_realized_r: Optional[float],
+        post_exit_mfe_r: float,
+        post_exit_mae_r: float,
+    ) -> bool:
+        try:
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.execute("PRAGMA busy_timeout=10000")
+                cursor = conn.execute(
+                    """
+                    UPDATE exit_counterfactual
+                    SET status=?, resolved_at_utc=?,
+                        counterfactual_exit_price=?, outcome_r=?,
+                        delta_vs_realized_r=?, post_exit_mfe_r=?,
+                        post_exit_mae_r=?
+                    WHERE id=? AND status='PENDING'
+                    """,
+                    (
+                        str(status).upper(), str(resolved_at_utc),
+                        float(exit_price),
+                        None if outcome_r is None else float(outcome_r),
+                        None if delta_vs_realized_r is None else float(delta_vs_realized_r),
+                        float(post_exit_mfe_r), float(post_exit_mae_r),
+                        int(candidate_id),
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+        except Exception as exc:
+            logger.error("Error resolving exit counterfactual: %s", exc)
+            return False
+
+    def exit_counterfactual_summary(self) -> Dict[str, Any]:
+        """Summarize whether original-bracket holds beat actual strategy exits."""
+        empty = {
+            "exit_pending": 0,
+            "exit_resolved": 0,
+            "exit_held_better": 0,
+            "exit_actual_better": 0,
+            "exit_average_delta_r": 0.0,
+            "exit_horizon_breakdown": [],
+        }
+        try:
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=10000")
+                row = conn.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END) pending,
+                        SUM(CASE WHEN status<>'PENDING' THEN 1 ELSE 0 END) resolved,
+                        SUM(CASE WHEN delta_vs_realized_r > 0.05 THEN 1 ELSE 0 END) held_better,
+                        SUM(CASE WHEN delta_vs_realized_r < -0.05 THEN 1 ELSE 0 END) actual_better,
+                        AVG(delta_vs_realized_r) average_delta_r
+                    FROM exit_counterfactual
+                    """
+                ).fetchone()
+                horizons = conn.execute(
+                    """
+                    SELECT horizon_minutes,
+                           COUNT(*) resolved,
+                           AVG(delta_vs_realized_r) average_delta_r
+                    FROM exit_counterfactual
+                    WHERE status<>'PENDING'
+                      AND delta_vs_realized_r IS NOT NULL
+                    GROUP BY horizon_minutes
+                    ORDER BY horizon_minutes
+                    """
+                ).fetchall()
+            return {
+                "exit_pending": int(row["pending"] or 0),
+                "exit_resolved": int(row["resolved"] or 0),
+                "exit_held_better": int(row["held_better"] or 0),
+                "exit_actual_better": int(row["actual_better"] or 0),
+                "exit_average_delta_r": round(
+                    float(row["average_delta_r"] or 0.0), 3
+                ),
+                "exit_horizon_breakdown": [
+                    {
+                        "minutes": int(item["horizon_minutes"]),
+                        "resolved": int(item["resolved"] or 0),
+                        "average_delta_r": round(
+                            float(item["average_delta_r"] or 0.0), 3
+                        ),
+                    }
+                    for item in horizons
+                ],
+            }
+        except Exception as exc:
+            logger.error("Error summarizing exit counterfactuals: %s", exc)
+            return empty
 
     def shadow_summary(self) -> Dict[str, Any]:
         """Return compact rejected-signal and direction-funnel diagnostics.

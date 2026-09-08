@@ -237,13 +237,10 @@ class AdaptiveMarketSelector:
         ranked: Iterable[Dict[str, Any]],
         maximum: int,
     ) -> List[str]:
-        """Select active markets while retaining non-fit discovery fallbacks.
+        """Prioritize verified opportunities, then affordable watch candidates.
 
-        Ranking remains evidence-based, but a market whose current minimum
-        broker volume fits the account must not lose an active slot to a
-        higher-scoring market that cannot currently be executed.  Non-fit
-        markets remain eligible to fill any slots left after the capital-fit
-        tier, so discovery stays broad.
+        Within each tier, retain the evidence-based score ordering. Non-fit
+        instruments fill remaining slots for continued deterministic discovery.
         """
         eligible = [
             item
@@ -260,8 +257,10 @@ class AdaptiveMarketSelector:
             reverse=True,
         )
         capital_fit = [item for item in eligible if item.get("capital_fit") is True]
+        actionable = [item for item in capital_fit if item.get("model_eligible")]
+        waiting = [item for item in capital_fit if not item.get("model_eligible")]
         discovery = [item for item in eligible if item.get("capital_fit") is not True]
-        prioritized = capital_fit + discovery
+        prioritized = actionable + waiting + discovery
         return [
             str(item.get("symbol", "")).upper()
             for item in prioritized[: max(1, int(maximum))]

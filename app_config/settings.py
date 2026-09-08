@@ -82,9 +82,11 @@ class AppConfig:
     llm_provider: str = _choice(
         "LLM_PROVIDER", "deterministic", {"deterministic", "local", "openai"}
     )
-    local_llm_model: str = os.getenv("LOCAL_LLM_MODEL", "qwen/qwen3.5-9b")
+    local_llm_model: str = os.getenv(
+        "LOCAL_LLM_MODEL", "qwen/qwen3.5-9b"
+    ).strip()
     local_llm_required_quantization: str = os.getenv(
-        "LOCAL_LLM_REQUIRED_QUANTIZATION", ""
+        "LOCAL_LLM_REQUIRED_QUANTIZATION", "AUTO"
     ).strip().upper()
     local_llm_url: str = os.getenv(
         "LOCAL_LLM_URL", "http://127.0.0.1:1234/v1/chat/completions"
@@ -96,8 +98,10 @@ class AppConfig:
     # Trading decisions are a six-field JSON object, not long-form analysis.
     # Bounding completion length materially reduces tail latency and prevents
     # small local models from spending the entry window on hidden verbosity.
+    # Reasoning-only models may need a larger explicit budget; the request
+    # timeout and engine freshness limits still bound execution latency.
     local_llm_max_tokens: int = max(
-        96, min(512, int(os.getenv("LOCAL_LLM_MAX_TOKENS", "220")))
+        96, min(32768, int(os.getenv("LOCAL_LLM_MAX_TOKENS", "220")))
     )
     local_llm_timeout: float = float(os.getenv("LOCAL_LLM_TIMEOUT", "45.0"))
     local_llm_max_retries: int = int(os.getenv("LOCAL_LLM_MAX_RETRIES", "2"))
@@ -212,6 +216,10 @@ class AppConfig:
     market_selection_refresh_seconds: float = max(
         30.0, float(os.getenv("MARKET_SELECTION_REFRESH_SECONDS", "60"))
     )
+    broker_market_discovery_enabled: bool = _bool("BROKER_MARKET_DISCOVERY_ENABLED", False)
+    broker_market_group: str = os.getenv("BROKER_MARKET_GROUP", "*").strip() or "*"
+    broker_market_batch_size: int = max(1, min(64, int(os.getenv("BROKER_MARKET_BATCH_SIZE", "12"))))
+    broker_market_refresh_seconds: float = max(60.0, float(os.getenv("BROKER_MARKET_REFRESH_SECONDS", "300")))
     market_performance_lookback: int = max(
         3, int(os.getenv("MARKET_PERFORMANCE_LOOKBACK", "8"))
     )
@@ -432,6 +440,13 @@ class AppConfig:
     same_thesis_reentry_min_bars: int = max(
         1, int(os.getenv("SAME_THESIS_REENTRY_MIN_BARS", "2"))
     )
+    # A broker-protected winner may resume sooner than a failed thesis, but it
+    # must still wait for a wholly post-close M5 candle and pass the normal
+    # fresh-structure gate.  Keeping a separate value avoids weakening the
+    # anti-churn protection after a loss.
+    same_thesis_profit_reentry_min_bars: int = max(
+        1, int(os.getenv("SAME_THESIS_PROFIT_REENTRY_MIN_BARS", "1"))
+    )
     retest_continuation_enabled: bool = _bool(
         "RETEST_CONTINUATION_ENABLED", True
     )
@@ -601,15 +616,65 @@ class AppConfig:
         0.95,
         max(0.05, float(os.getenv("PROFIT_LOCK_MID_FRACTION", "0.35"))),
     )
+    # Once a trade has made meaningful progress, install a durable floor in
+    # original-risk units. This preserves the useful intent of the former $1
+    # lock while scaling across symbols, lot sizes, and future account sizes.
+    profit_lock_mature_trigger_r: float = max(
+        profit_lock_mid_trigger_r,
+        float(os.getenv("PROFIT_LOCK_MATURE_TRIGGER_R", "1.25")),
+    )
+    profit_lock_mature_floor_r: float = min(
+        0.95,
+        max(0.05, float(os.getenv("PROFIT_LOCK_MATURE_FLOOR_R", "0.70"))),
+    )
     profit_lock_final_trigger_usd: float = max(
         profit_lock_mid_trigger_usd,
         float(os.getenv("PROFIT_LOCK_FINAL_TRIGGER_USD", "1.15")),
+    )
+    profit_lock_final_trigger_r: float = max(
+        profit_lock_trigger_r,
+        float(os.getenv("PROFIT_LOCK_FINAL_TRIGGER_R", "0.60")),
     )
     profit_lock_final_floor_usd: float = max(
         profit_lock_floor_usd,
         float(os.getenv("PROFIT_LOCK_FINAL_FLOOR_USD", "1.00")),
     )
+    profit_lock_final_max_floor_r: float = min(
+        0.95,
+        max(0.05, float(os.getenv("PROFIT_LOCK_FINAL_MAX_FLOOR_R", "0.55"))),
+    )
+    # With a valid risk baseline, the dollar tier is capped in R so it cannot
+    # become disproportionately tight on small trades or meaningless as size
+    # grows. Without a baseline, the original dollar rule remains the bounded
+    # recovery fallback.
+    profit_lock_final_fallback_only: bool = _bool(
+        "PROFIT_LOCK_FINAL_FALLBACK_ONLY", False
+    )
     profit_giveback_enabled: bool = _bool("PROFIT_GIVEBACK_ENABLED", True)
+    # Mature net-profit ratchet, independent of the earlier R-capped cash tier.
+    # Dollar fields are account-currency amounts (USD on the configured account).
+    profit_retention_enabled: bool = _bool("PROFIT_RETENTION_ENABLED", True)
+    profit_retention_min_headroom_usd: float = max(
+        0.01, float(os.getenv("PROFIT_RETENTION_MIN_HEADROOM_USD", "0.20"))
+    )
+    profit_retention_trigger_usd: float = max(
+        profit_lock_final_floor_usd + profit_retention_min_headroom_usd,
+        float(os.getenv("PROFIT_RETENTION_TRIGGER_USD", "1.50")),
+    )
+    profit_retention_trigger_r: float = max(
+        0.1, float(os.getenv("PROFIT_RETENTION_TRIGGER_R", "1.00"))
+    )
+    profit_retention_keep_fraction: float = min(
+        0.95, max(0.05, float(os.getenv("PROFIT_RETENTION_KEEP_FRACTION", "0.65")))
+    )
+    profit_retention_mature_trigger_r: float = max(
+        profit_retention_trigger_r,
+        float(os.getenv("PROFIT_RETENTION_MATURE_TRIGGER_R", "2.00")),
+    )
+    profit_retention_mature_keep_fraction: float = min(
+        0.95, max(profit_retention_keep_fraction,
+                  float(os.getenv("PROFIT_RETENTION_MATURE_KEEP_FRACTION", "0.75")))
+    )
     profit_giveback_trigger_r: float = max(
         0.1, float(os.getenv("PROFIT_GIVEBACK_TRIGGER_R", "0.50"))
     )
@@ -633,7 +698,7 @@ class AppConfig:
     breakeven_trigger_r: float = float(os.getenv("BREAKEVEN_TRIGGER_R", "0.75"))
     breakeven_buffer_pips: float = float(os.getenv("BREAKEVEN_BUFFER_PIPS", "0.2"))
     trailing_trigger_r: float = float(os.getenv("TRAILING_TRIGGER_R", "1.0"))
-    trailing_distance_r: float = float(os.getenv("TRAILING_DISTANCE_R", "0.60"))
+    trailing_distance_r: float = float(os.getenv("TRAILING_DISTANCE_R", "1.00"))
     position_stagnation_exit_enabled: bool = _bool(
         "POSITION_STAGNATION_EXIT_ENABLED", True
     )
@@ -678,6 +743,22 @@ class AppConfig:
     )
     shadow_outcome_poll_seconds: float = max(
         10.0, float(os.getenv("SHADOW_OUTCOME_POLL_SECONDS", "30"))
+    )
+    # Post-exit counterfactuals compare the realized strategy exit with the
+    # original SL/TP held for several fixed horizons. They are diagnostic only
+    # and never feed back into live order decisions automatically.
+    exit_counterfactual_enabled: bool = _bool(
+        "EXIT_COUNTERFACTUAL_ENABLED", True
+    )
+    exit_counterfactual_horizons_minutes: List[int] = field(
+        default_factory=lambda: sorted(
+            {
+                max(5, min(240, int(value)))
+                for value in _csv(
+                    "EXIT_COUNTERFACTUAL_HORIZONS_MINUTES", "15,30,60"
+                )
+            }
+        )
     )
 
     # Time/session behavior

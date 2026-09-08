@@ -568,7 +568,8 @@ function renderPositions(positions, account) {
       `${liveR >= 0 ? "+" : ""}${liveR.toFixed(2)} R live · peak ${money(position.peak_profit_usd, currency)}`,
       position.profit_lock_armed ? "positive" : ""
     );
-    if (position.profit_lock_armed) management.append(node("small", "ownership", "PROFIT LOCK ARMED"));
+    if (position.profit_lock_armed) management.append(node("small", "ownership", `BROKER FLOOR ${money(position.profit_lock_floor_usd, currency)} EST.`));
+    if (finite(position.profit_retention_floor_usd) > 0) management.append(node("small", "ownership", `NET RETENTION ${money(position.profit_retention_floor_usd, currency)}`));
     appendCell(row, "Plan", management, "mono");
     const manage = node("button", "button secondary", "Manage");
     manage.type = "button";
@@ -1045,7 +1046,8 @@ function renderCapitalFits(fits, account) {
   const fitCount = values.filter(([, fit]) => fit.capital_fit).length;
   setText("market-fit-count", `${fitCount}/${values.length} FIT`);
   const selectedCount = values.filter(([, fit]) => fit.selected).length;
-  setText("capital-fit-summary", `${selectedCount} market${selectedCount === 1 ? "" : "s"} scanned`);
+  const readyCount = values.filter(([, fit]) => fit.model_eligible).length;
+  setText("capital-fit-summary", `${values.length} assessed / ${selectedCount} active / ${readyCount} ready for review`);
   const lowestRisk = Math.min(...values.map(([, fit]) => finite(fit.min_stop_risk_usd, Infinity)));
   if (Number.isFinite(lowestRisk)) setText("budget-detail", `Execution only: lowest current stop risk ${money(lowestRisk, currency)}`);
 
@@ -1062,6 +1064,11 @@ function renderCapitalFits(fits, account) {
         : fit.status || (fit.capital_fit ? "CAPITAL FIT" : "BLOCKED");
     top.append(node("strong", "", symbol), node("span", "fit-status", statusText));
     card.append(top, node("p", "fit-reason", fit.reason || "Awaiting broker feasibility details."));
+    const opportunityReasons = [
+      fit.entry_prefilter_reason,
+      ...Object.entries(fit.opportunity_rejections || {}).map(([side, reason]) => `${side}: ${reason}`),
+    ].filter(Boolean);
+    if (opportunityReasons.length) card.append(node("p", "fit-reason", opportunityReasons.join("; ")));
     const stats = node("div", "fit-stats");
     const statValues = [
       ["Min stop risk", finite(fit.min_stop_risk_usd) > 0 ? money(fit.min_stop_risk_usd, currency) : "—"],
@@ -1069,6 +1076,8 @@ function renderCapitalFits(fits, account) {
       ["Projected use", finite(fit.projected_margin_pct) > 0 ? `${finite(fit.projected_margin_pct).toFixed(1)}%` : "—"],
       ["Spread", `${finite(fit.spread_value).toFixed(1)} ${fit.spread_unit || ""}`],
       ["Adaptive score", `${finite(fit.selection_score).toFixed(1)}/100`],
+      ["Opportunity", fit.opportunity_status || "ASSESSING"],
+      ["Verified directions", (fit.viable_entry_actions || []).join(" / ") || "NONE"],
       ["Selection", fit.model_selected
         ? `MODEL QUEUE · #${fit.model_selection_rank || "—"}`
         : fit.selected
@@ -1113,6 +1122,19 @@ function renderCapitalFits(fits, account) {
 }
 
 function renderShadowEvidence(shadow) {
+  const exitResolved = Math.max(0, Math.floor(finite(shadow.exit_resolved)));
+  const exitPending = Math.max(0, Math.floor(finite(shadow.exit_pending)));
+  const exitHorizons = Array.isArray(shadow.exit_horizon_breakdown)
+    ? shadow.exit_horizon_breakdown
+    : [];
+  setText(
+    "exit-counterfactual",
+    !shadow.exit_enabled
+      ? "Post-exit hold comparison is disabled."
+      : exitResolved
+        ? `Post-exit original-bracket replay: ${exitResolved} resolved, ${exitPending} pending · hold minus actual ${finite(shadow.exit_average_delta_r).toFixed(2)} R average (${Math.floor(finite(shadow.exit_held_better))} hold-better, ${Math.floor(finite(shadow.exit_actual_better))} actual-better). ${exitHorizons.map((item) => `${Math.floor(finite(item.minutes))}m ${finite(item.average_delta_r).toFixed(2)} R`).join(" · ")}. Diagnostic only.`
+        : `${exitPending} post-exit hold comparison${exitPending === 1 ? "" : "s"} pending; live exit rules are never changed automatically.`,
+  );
   if (!shadow.enabled) {
     setText("shadow-summary", "Rejected-signal outcome evaluation is disabled.");
     setText("shadow-gates", "Recent gate outcomes are unavailable.");
@@ -1599,6 +1621,8 @@ function fillSettings(config) {
   $("c-unconfirmed-bos-zone").value = config.entry_unconfirmed_bos_min_opposing_distance_atr ?? 1.75;
   $("c-cost-extension").value = config.plan_max_cost_target_extension_r ?? .5;
   $("c-reentry-bars").value = config.same_thesis_reentry_min_bars ?? 2;
+  $("c-profit-reentry-bars").value =
+    config.same_thesis_profit_reentry_min_bars ?? 1;
   $("c-retest").value = String(config.retest_continuation_enabled ?? true);
   $("c-retest-min").value = config.retest_min_resumption_atr ?? .1;
   $("c-micro-profit").value = String(
@@ -1615,6 +1639,9 @@ function fillSettings(config) {
   $("c-profit-lock").value = String(config.profit_lock_enabled ?? true);
   $("c-lock-trigger").value = config.profit_lock_trigger_r ?? .50;
   $("c-lock-floor").value = config.profit_lock_floor_usd ?? .08;
+  $("c-final-lock-fallback").value = String(
+    config.profit_lock_final_fallback_only ?? true
+  );
   $("c-giveback").value = String(config.profit_giveback_enabled ?? true);
   $("c-giveback-trigger").value = config.profit_giveback_trigger_r ?? .5;
   $("c-giveback-close-min").value = config.profit_giveback_close_min_r ?? 1;
@@ -1670,13 +1697,13 @@ function syncDecisionProviderFields(resetModel = true) {
 }
 
 function syncQuantizationProfile() {
-  const quantization = $("c-quantization").value || "AUTO";
+  const quantization = $("c-quantization").value.trim().toUpperCase() || "AUTO";
   // Keep the project semaphore aligned with LM Studio's single loaded model
   // instance. Quantization changes memory/latency, not the safe parallelism
   // contract; hidden concurrency changes previously caused readiness failure.
   const concurrency = 1;
   const profileLabel = quantization === "AUTO"
-    ? "follows Q4_K_M / Q6_K / Q8_0"
+    ? "follows any loaded quantization"
     : quantization;
   setText(
     "c-concurrency-profile",
@@ -1684,14 +1711,13 @@ function syncQuantizationProfile() {
   );
   const health = app.localModelHealth || {};
   const loaded = health.quantization || "not detected";
-  const supported = health.supported_quantizations || ["Q4_K_M", "Q6_K", "Q8_0"];
   const matches = quantization === "AUTO"
-    ? supported.includes(loaded)
-    : loaded === quantization;
+    ? Boolean(health.loaded || health.available)
+    : String(loaded).toUpperCase() === quantization;
   const status = matches
     ? "match"
     : quantization === "AUTO"
-      ? "load Q4_K_M, Q6_K, or Q8_0"
+      ? "load the configured chat model in LM Studio"
       : "load the selected variant";
   setText(
     "c-quantization-hint",
@@ -1752,6 +1778,7 @@ async function saveSettings(event) {
       ENTRY_UNCONFIRMED_BOS_MIN_OPPOSING_DISTANCE_ATR: $("c-unconfirmed-bos-zone").value,
       PLAN_MAX_COST_TARGET_EXTENSION_R: $("c-cost-extension").value,
       SAME_THESIS_REENTRY_MIN_BARS: $("c-reentry-bars").value,
+      SAME_THESIS_PROFIT_REENTRY_MIN_BARS: $("c-profit-reentry-bars").value,
       RETEST_CONTINUATION_ENABLED: $("c-retest").value,
       RETEST_MIN_RESUMPTION_ATR: $("c-retest-min").value,
       MICRO_PROFIT_PROTECTION_ENABLED: $("c-micro-profit").value,
@@ -1766,6 +1793,7 @@ async function saveSettings(event) {
       PROFIT_LOCK_ENABLED: $("c-profit-lock").value,
       PROFIT_LOCK_TRIGGER_R: $("c-lock-trigger").value,
       PROFIT_LOCK_FLOOR_USD: $("c-lock-floor").value,
+      PROFIT_LOCK_FINAL_FALLBACK_ONLY: $("c-final-lock-fallback").value,
       PROFIT_GIVEBACK_ENABLED: $("c-giveback").value,
       PROFIT_GIVEBACK_TRIGGER_R: $("c-giveback-trigger").value,
       PROFIT_GIVEBACK_CLOSE_MIN_R: $("c-giveback-close-min").value,

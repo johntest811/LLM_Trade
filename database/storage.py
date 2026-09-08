@@ -113,6 +113,20 @@ class TradingDatabase:
             )
         """)
 
+        # MT5 reports application-submitted market closes as EXPERT. Preserve
+        # the engine's more specific reason independently so reconciliation and
+        # restarts cannot erase whether the strategy used giveback, reversal,
+        # stagnation, model, or operator logic.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_close_reasons (
+                account_login INTEGER NOT NULL,
+                position_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (account_login, position_id)
+            )
+        """)
+
         # Migrate the original single-account schema without losing history.
         # Legacy rows remain under account 0; all new reconciliations are scoped
         # to the active MT5 login so demo/live histories cannot contaminate one
@@ -207,6 +221,101 @@ class TradingDatabase:
                 )
 
         conn.commit()
+
+    async def set_strategy_close_reason(
+        self,
+        account_login: int,
+        position_id: int,
+        reason: str,
+    ) -> bool:
+        """Persist the exact strategy cause for an application-led close."""
+        normalized = str(reason or "").strip().upper()
+        if int(position_id) <= 0 or not normalized:
+            return False
+
+        def _write() -> bool:
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.execute("PRAGMA busy_timeout=10000")
+                conn.execute(
+                    """
+                    INSERT INTO strategy_close_reasons (
+                        account_login, position_id, reason, recorded_at
+                    ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(account_login, position_id) DO UPDATE SET
+                        reason=excluded.reason,
+                        recorded_at=excluded.recorded_at
+                    """,
+                    (int(account_login), int(position_id), normalized),
+                )
+                conn.commit()
+                return True
+
+        return await asyncio.to_thread(_write)
+
+    async def get_strategy_close_reasons(
+        self,
+        account_login: int,
+        position_ids: List[int],
+    ) -> Dict[int, str]:
+        """Return account-scoped close reasons, including legacy replay rows."""
+        tickets = sorted({int(value) for value in position_ids if int(value) > 0})
+        if not tickets:
+            return {}
+
+        def _read() -> Dict[int, str]:
+            placeholders = ",".join("?" for _ in tickets)
+            generic = {
+                "", "CLIENT", "MOBILE", "WEB", "EXPERT", "OTHER",
+                "UNKNOWN", "SIGNAL",
+            }
+            with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout=10000")
+                rows = conn.execute(
+                    f"""
+                    SELECT position_id, reason
+                    FROM strategy_close_reasons
+                    WHERE account_login=? AND position_id IN ({placeholders})
+                    """,
+                    (int(account_login), *tickets),
+                ).fetchall()
+                reasons = {
+                    int(row["position_id"]): str(row["reason"] or "").upper()
+                    for row in rows
+                }
+
+                # Upgrade existing histories created before the durable reason
+                # table. The account-scoped closed row prevents a replay ticket
+                # from a different account being adopted accidentally.
+                missing = [ticket for ticket in tickets if ticket not in reasons]
+                if missing:
+                    try:
+                        legacy_placeholders = ",".join("?" for _ in missing)
+                        legacy_rows = conn.execute(
+                            f"""
+                            SELECT tr.ticket, tr.close_reason
+                            FROM trade_replay AS tr
+                            JOIN closed_positions AS cp
+                              ON cp.position_id=tr.ticket
+                             AND cp.account_login=?
+                            WHERE tr.ticket IN ({legacy_placeholders})
+                              AND tr.close_reason IS NOT NULL
+                            ORDER BY tr.id DESC
+                            """,
+                            (int(account_login), *missing),
+                        ).fetchall()
+                        for row in legacy_rows:
+                            ticket = int(row["ticket"] or 0)
+                            reason = str(row["close_reason"] or "").strip().upper()
+                            if ticket not in reasons and reason not in generic:
+                                reasons[ticket] = reason
+                    except sqlite3.OperationalError:
+                        # trade_replay is initialized by a separate component;
+                        # a fresh database may legitimately not have it yet.
+                        pass
+                return reasons
+
+        return await asyncio.to_thread(_read)
 
     async def log_trade(self, trade_data: Dict[str, Any]) -> bool:
         """
@@ -447,7 +556,19 @@ class TradingDatabase:
                         swap=excluded.swap,
                         fee=excluded.fee,
                         net_profit=excluded.net_profit,
-                        close_reason=excluded.close_reason,
+                        close_reason=CASE
+                            WHEN UPPER(COALESCE(excluded.close_reason, '')) IN (
+                                '', 'CLIENT', 'MOBILE', 'WEB', 'EXPERT',
+                                'OTHER', 'UNKNOWN', 'SIGNAL'
+                            )
+                            AND UPPER(COALESCE(closed_positions.close_reason, ''))
+                                NOT IN (
+                                    '', 'CLIENT', 'MOBILE', 'WEB', 'EXPERT',
+                                    'OTHER', 'UNKNOWN', 'SIGNAL'
+                                )
+                            THEN closed_positions.close_reason
+                            ELSE excluded.close_reason
+                        END,
                         profit_pips=excluded.profit_pips,
                         initial_risk_pips=excluded.initial_risk_pips,
                         initial_risk_usd=excluded.initial_risk_usd,

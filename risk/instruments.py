@@ -7,6 +7,7 @@ therefore measured in basis points while FX/metals retain conventional pips.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from app_config.settings import settings
@@ -16,6 +17,10 @@ _CRYPTO_CODES = {
     "ADA", "AVAX", "BCH", "BNB", "BTC", "DOGE", "DOT", "EOS", "ETH",
     "LINK", "LTC", "MATIC", "NEAR", "SOL", "TRX", "UNI", "XLM", "XRP",
 }
+_CRYPTO_PAIR_PATTERN = re.compile(
+    r"(?:^|[^A-Z0-9])(?:" + "|".join(sorted(_CRYPTO_CODES, key=len, reverse=True))
+    + r")(?:USDT|USDC|USD|EUR|GBP|JPY|AUD|CAD|CHF|NZD)[A-Z]{0,2}(?:$|[^A-Z0-9])"
+)
 
 _TRADE_MODE_DISABLED = 0
 _TRADE_MODE_LONG_ONLY = 1
@@ -28,8 +33,15 @@ def is_crypto_symbol(symbol: str, info: Any = None) -> bool:
     path = str(getattr(info, "path", "") or "").lower()
     if "crypto" in path:
         return True
+    # A stock/company name containing ADA, SOL, UNI, etc. is not evidence
+    # of a cryptocurrency contract. Prefer the broker's asset category.
+    if any(category in path for category in ("stock", "share", "equit", "forex", "indice", "index", "commodit", "metal")):
+        return False
     upper = str(symbol).upper()
-    return any(code in upper for code in _CRYPTO_CODES)
+    base = str(getattr(info, "currency_base", "") or "").upper()
+    if base in _CRYPTO_CODES:
+        return True
+    return bool(_CRYPTO_PAIR_PATTERN.search(upper))
 
 
 def validate_symbol_trade_mode(info: Any, action: str) -> Tuple[bool, str]:
@@ -64,6 +76,40 @@ def pip_size(info: Any) -> float:
     point = float(getattr(info, "point", 0.0) or 0.0)
     digits = int(getattr(info, "digits", 0) or 0)
     return point * 10.0 if digits in (3, 5) else point
+
+
+def analysis_pip_size(analysis: Dict[str, Any]) -> float:
+    """Use broker units; retain historical conventions for legacy snapshots."""
+    try:
+        value = float((analysis.get("indicators") or {}).get("pip_size") or 0.0)
+    except (ValueError, TypeError, OverflowError):
+        value = 0.0
+    if math.isfinite(value) and value > 0:
+        return value
+    symbol = str(analysis.get("symbol", "")).upper()
+    if any(code in symbol for code in ("ETH", "LTC", "BTC")):
+        return 1.0
+    if any(code in symbol for code in ("XRP", "JPY", "XAU", "GOLD")):
+        return 0.01
+    return 0.0001
+
+
+def analysis_atr_price(analysis: Dict[str, Any]) -> float:
+    """ATR in price units, independent of a broker's display digits."""
+    indicators = analysis.get("indicators") or {}
+    raw = indicators.get("atr_14")
+    try:
+        value = float(raw) if raw is not None else float(indicators.get("atr_14_pips") or 0.0) * analysis_pip_size(analysis)
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def analysis_is_crypto(analysis: Dict[str, Any], symbol: str = "") -> bool:
+    asset_class = str(analysis.get("asset_class", "")).upper()
+    if asset_class:
+        return asset_class == "CRYPTO"
+    return is_crypto_symbol(symbol or str(analysis.get("symbol", "")))
 
 
 def spread_metrics(symbol: str, info: Any, tick: Any) -> Dict[str, float | str]:

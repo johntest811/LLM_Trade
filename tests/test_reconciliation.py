@@ -43,6 +43,28 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(rows[0]["open_time"], "2023-11-14T22:13:20+00:00")
         self.assertEqual(rows[0]["close_time"], "2023-11-14T22:14:20+00:00")
 
+    def test_profitable_stop_activation_is_labeled_as_protective(self):
+        deals = [
+            Deal(11, 100, 100000, 0, 1, 0.01, 182.700, 0, 0, 0, 0, 202600, "EURJPY", 3),
+            Deal(11, 200, 200000, 1, 0, 0.01, 182.550, 1.0, 0, 0, 0, 202600, "EURJPY", 4),
+        ]
+
+        rows = aggregate_closed_positions(deals, 202600)
+
+        self.assertEqual(rows[0]["close_reason"], "PROTECTIVE_STOP")
+        self.assertGreater(rows[0]["net_profit"], 0)
+
+    def test_losing_stop_activation_remains_stop_loss(self):
+        deals = [
+            Deal(12, 100, 100000, 0, 0, 0.01, 1.1000, 0, 0, 0, 0, 202600, "EURUSD", 3),
+            Deal(12, 200, 200000, 1, 1, 0.01, 1.0980, -1.0, 0, 0, 0, 202600, "EURUSD", 4),
+        ]
+
+        rows = aggregate_closed_positions(deals, 202600)
+
+        self.assertEqual(rows[0]["close_reason"], "STOP_LOSS")
+        self.assertLess(rows[0]["net_profit"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

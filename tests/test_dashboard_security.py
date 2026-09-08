@@ -45,15 +45,24 @@ class DashboardSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("No permitted", json.loads(response.body)["error"])
 
-    def test_config_rejects_unknown_local_quantization(self):
-        response = asyncio.run(
-            save_config({"LOCAL_LLM_REQUIRED_QUANTIZATION": "Q5_K"})
-        )
+    def test_config_accepts_arbitrary_local_quantization_pins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            with patch("ui.dashboard._config_env_path", return_value=env_path):
+                for quantization in ("AUTO", "Q5_K", "IQ4_XS", "F16", "NEW_QUANT"):
+                    with self.subTest(quantization=quantization):
+                        result = asyncio.run(save_config({
+                            "LOCAL_LLM_REQUIRED_QUANTIZATION": quantization,
+                            "LOCAL_LLM_MODEL": "vendor/model@iq4_xs",
+                        }))
+                        self.assertEqual(result["status"], "saved")
+                        saved = env_path.read_text(encoding="utf-8")
+                        self.assertIn(f"LOCAL_LLM_REQUIRED_QUANTIZATION={quantization}", saved)
+                        self.assertIn("LOCAL_LLM_MODEL=vendor/model@iq4_xs", saved)
+
+    def test_config_rejects_malformed_quantization_pin(self):
+        response = asyncio.run(save_config({"LOCAL_LLM_REQUIRED_QUANTIZATION": "Q4 #invalid"}))
         self.assertEqual(response.status_code, 422)
-        self.assertIn(
-            "AUTO, Q4_K_M, Q6_K, or Q8_0",
-            json.loads(response.body)["error"],
-        )
 
     def test_config_persists_147_minimum_risk_reward(self):
         with tempfile.TemporaryDirectory() as temp_dir:

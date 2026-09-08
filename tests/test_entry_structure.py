@@ -511,6 +511,91 @@ class EntryStructureGateTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("closed with a profit", reason)
 
+    def test_profit_reentry_accepts_first_wholly_post_close_bar(self):
+        m5 = _analysis(
+            "M5",
+            trend="BEARISH",
+            direction="BEARISH",
+            timestamp="2026-07-23 07:30:00",
+            events=[{
+                "type": "BOS",
+                "direction": "BEARISH",
+                "time": "2026-07-23 07:30:00",
+            }],
+        )
+        history = [{
+            "direction": "SELL",
+            "net_profit": 0.50,
+            "close_time": "2026-07-23T07:27:45+00:00",
+        }]
+
+        ok, reason = RiskManager._check_same_thesis_reentry(
+            "SELL", m5, history
+        )
+
+        self.assertTrue(ok, reason)
+
+    def test_loss_reentry_waits_for_second_wholly_post_close_bar(self):
+        history = [{
+            "direction": "SELL",
+            "net_profit": -0.50,
+            "close_time": "2026-07-23T07:27:45+00:00",
+        }]
+        first_bar = _analysis(
+            "M5",
+            trend="BEARISH",
+            direction="BEARISH",
+            timestamp="2026-07-23 07:30:00",
+            events=[{
+                "type": "BOS",
+                "direction": "BEARISH",
+                "time": "2026-07-23 07:30:00",
+            }],
+        )
+        second_bar = _analysis(
+            "M5",
+            trend="BEARISH",
+            direction="BEARISH",
+            timestamp="2026-07-23 07:35:00",
+            events=[{
+                "type": "BOS",
+                "direction": "BEARISH",
+                "time": "2026-07-23 07:35:00",
+            }],
+        )
+
+        first_ok, first_reason = RiskManager._check_same_thesis_reentry(
+            "SELL", first_bar, history
+        )
+        second_ok, second_reason = RiskManager._check_same_thesis_reentry(
+            "SELL", second_bar, history
+        )
+
+        self.assertFalse(first_ok)
+        self.assertIn("Wait for at least 2 completed M5 bars", first_reason)
+        self.assertTrue(second_ok, second_reason)
+
+    def test_same_thesis_message_distinguishes_completed_cooldown(self):
+        m5 = _analysis(
+            "M5",
+            trend="BEARISH",
+            direction="BEARISH",
+            timestamp="2026-07-23 07:45:00",
+        )
+        history = [{
+            "direction": "SELL",
+            "net_profit": 0.50,
+            "close_time": "2026-07-23T07:27:45+00:00",
+        }]
+
+        ok, reason = RiskManager._check_same_thesis_reentry(
+            "SELL", m5, history
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("1-bar cooldown has completed", reason)
+        self.assertIn("no new directional BOS/CHoCH", reason)
+
     def test_opposite_direction_close_does_not_block_new_thesis(self):
         m5 = _analysis(
             "M5",

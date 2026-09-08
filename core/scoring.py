@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 
 from app_config.settings import settings
+from risk.instruments import analysis_atr_price, analysis_is_crypto, analysis_pip_size
 
 logger = logging.getLogger("TradingSystem.ScoringEngine")
 
@@ -90,15 +91,7 @@ class DecisionScoringEngine:
             )
 
         symbol = m5_analysis.get("symbol", "")
-        # Resolve pip multiplier based on currency properties
-        if any(c in symbol.upper() for c in ["ETH", "LTC", "BTC"]):
-            pip_multi = 1.0
-        elif "XRP" in symbol.upper():
-            pip_multi = 100.0
-        elif any(j in symbol.upper() for j in ["JPY", "XAU", "GOLD"]):
-            pip_multi = 100.0
-        else:
-            pip_multi = 10000.0
+        pip_multi = 1.0 / analysis_pip_size(m5_analysis)
 
         # 2. Support / Resistance Proximity
         close_price = ind_m5.get("current_price", 0.0)
@@ -196,10 +189,10 @@ class DecisionScoringEngine:
 
         # 9. ATR Status (volatility expansion)
         atr = ind_m5.get("atr_14_pips", 0.0)
-        is_crypto = any(c in symbol.upper() for c in ["ETH", "LTC", "XRP", "BTC"])
+        is_crypto = analysis_is_crypto(m5_analysis)
         if is_crypto:
             price = ind_m5.get("current_price", 1.0)
-            raw_atr = atr / 100.0 if "XRP" in symbol.upper() else atr
+            raw_atr = analysis_atr_price(m5_analysis)
             factors["atr_expansion"] = (raw_atr > (price * 0.0004))
         else:
             factors["atr_expansion"] = (atr >= 1.0)  # minimum volatility threshold lowered to 1.0 pips
@@ -389,18 +382,9 @@ class DecisionScoringEngine:
         liq_pts = 0
         liq = struct_m5.get("liquidity_zones", {})
         symbol = m5_analysis.get("symbol", "")
-        is_crypto = any(c in symbol.upper() for c in ["ETH", "LTC", "XRP", "BTC"])
+        is_crypto = analysis_is_crypto(m5_analysis)
 
-        # Resolve pip multiplier based on currency properties
-        if is_crypto:
-            if "XRP" in symbol.upper():
-                pip_multi = 100.0
-            else:
-                pip_multi = 1.0
-        elif any(j in symbol.upper() for j in ["JPY", "XAU", "GOLD"]):
-            pip_multi = 100.0
-        else:
-            pip_multi = 10000.0
+        pip_multi = 1.0 / analysis_pip_size(m5_analysis)
 
         if is_buy:
             for lvl in liq.get("sell_side_liquidity_levels", []):
@@ -418,7 +402,7 @@ class DecisionScoringEngine:
         # Optimal volatility: not too low (ranging squeeze) and not excessively high (panic spreads)
         if is_crypto:
             price = ind_m5.get("current_price", 1.0)
-            raw_atr = atr_pips / 100.0 if "XRP" in symbol.upper() else atr_pips
+            raw_atr = analysis_atr_price(m5_analysis)
             pct_atr = (raw_atr / price) * 100.0
             atr_pts = 50 if (0.04 <= pct_atr <= 0.6) else (20 if pct_atr > 0.6 else 10)
         else:

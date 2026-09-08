@@ -65,8 +65,21 @@ def aggregate_closed_positions(
         commission = sum(float(getattr(d, "commission", 0.0) or 0.0) for d in position_deals)
         swap = sum(float(getattr(d, "swap", 0.0) or 0.0) for d in position_deals)
         fee = sum(float(getattr(d, "fee", 0.0) or 0.0) for d in position_deals)
+        net_profit = round(gross + commission + swap + fee, 8)
         entry = entries[0]
         final_exit = exits[-1]
+        broker_reason = REASON_NAMES.get(
+            int(getattr(final_exit, "reason", -1)), "OTHER"
+        )
+        # MT5 correctly reports every activated SL as DEAL_REASON_SL, including
+        # a break-even, trailing, or profit-floor stop that has already crossed
+        # the entry price. Preserve the broker event while giving profitable
+        # exits an unambiguous strategy-facing label.
+        close_reason = (
+            "PROTECTIVE_STOP"
+            if broker_reason == "STOP_LOSS" and net_profit > 0
+            else broker_reason
+        )
         rows.append({
             "position_id": position_id,
             "open_time": datetime.fromtimestamp(
@@ -86,9 +99,9 @@ def aggregate_closed_positions(
             "commission": round(commission, 8),
             "swap": round(swap, 8),
             "fee": round(fee, 8),
-            "net_profit": round(gross + commission + swap + fee, 8),
+            "net_profit": net_profit,
             "magic": strategy_magic,
-            "close_reason": REASON_NAMES.get(int(getattr(final_exit, "reason", -1)), "OTHER"),
+            "close_reason": close_reason,
         })
     return sorted(rows, key=lambda row: row["close_time"], reverse=True)
 

@@ -141,6 +141,46 @@ class AccountScopedStorageTests(unittest.TestCase):
         self.assertEqual(row["mfe_usd"], 0.20)
         self.assertEqual(row["mae_usd"], -0.15)
 
+    def test_strategy_close_reason_is_account_scoped_and_survives_sync(self):
+        row = {
+            "position_id": 88,
+            "open_time": "2026-01-01T00:00:00+00:00",
+            "close_time": "2026-01-01T00:05:00+00:00",
+            "symbol": "AUDUSD",
+            "direction": "BUY",
+            "volume": 0.02,
+            "open_price": 0.71752,
+            "close_price": 0.71797,
+            "gross_profit": 0.90,
+            "commission": 0.0,
+            "swap": 0.0,
+            "fee": 0.0,
+            "net_profit": 0.90,
+            "magic": 202600,
+            "close_reason": "EXPERT",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = TradingDatabase(str(Path(temp_dir) / "reasons.db"))
+            self.assertTrue(asyncio.run(
+                database.set_strategy_close_reason(1001, 88, "profit_giveback")
+            ))
+            reasons = asyncio.run(
+                database.get_strategy_close_reasons(1001, [88])
+            )
+            other = asyncio.run(
+                database.get_strategy_close_reasons(2002, [88])
+            )
+            first = dict(row, close_reason="PROFIT_GIVEBACK")
+            asyncio.run(database.upsert_closed_positions([first], 1001))
+            asyncio.run(database.upsert_closed_positions([row], 1001))
+            closed = asyncio.run(
+                database.get_closed_positions(account_login=1001)
+            )
+
+        self.assertEqual(reasons, {88: "PROFIT_GIVEBACK"})
+        self.assertEqual(other, {})
+        self.assertEqual(closed[0]["close_reason"], "PROFIT_GIVEBACK")
+
 
 if __name__ == "__main__":
     unittest.main()

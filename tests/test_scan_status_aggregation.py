@@ -43,7 +43,9 @@ class ScanStatusAggregationTests(unittest.TestCase):
             engine._set_active_scan_symbols(["ETHUSD"])
 
         published = fake_dashboard.update_automation.call_args.kwargs["scan_status"]
-        self.assertEqual(published, "WAITING FOR NEXT M5 CLOSE")
+        self.assertEqual(
+            published, "MONITORING TICKS - NEXT ENTRY ON M5 CLOSE"
+        )
         self.assertEqual(engine._symbol_scan_states["USDJPY"], "STALE")
         self.assertEqual(engine._symbol_scan_states["CADJPY"], "ERROR")
 

@@ -8,6 +8,7 @@ Never blocks — all heavy work is delegated to the trading engine threads.
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Dict, Set, Tuple
@@ -332,6 +333,10 @@ async def get_config():
         "market_candidate_symbols": settings.market_candidate_symbols,
         "dynamic_market_max_symbols": settings.dynamic_market_max_symbols,
         "market_selection_refresh_seconds": settings.market_selection_refresh_seconds,
+        "broker_market_discovery_enabled": settings.broker_market_discovery_enabled,
+        "broker_market_group": settings.broker_market_group,
+        "broker_market_batch_size": settings.broker_market_batch_size,
+        "broker_market_refresh_seconds": settings.broker_market_refresh_seconds,
         "shadow_symbols": settings.shadow_symbols,
         "entry_min_adx": settings.entry_min_adx,
         "entry_require_adx_rising": settings.entry_require_adx_rising,
@@ -340,6 +345,9 @@ async def get_config():
             settings.entry_unconfirmed_bos_min_opposing_distance_atr
         ),
         "same_thesis_reentry_min_bars": settings.same_thesis_reentry_min_bars,
+        "same_thesis_profit_reentry_min_bars": (
+            settings.same_thesis_profit_reentry_min_bars
+        ),
         "retest_continuation_enabled": settings.retest_continuation_enabled,
         "retest_min_resumption_atr": settings.retest_min_resumption_atr,
         "timeframe": settings.trading_timeframe,
@@ -485,11 +493,27 @@ async def get_config():
         "profit_lock_mid_trigger_r": settings.profit_lock_mid_trigger_r,
         "profit_lock_mid_trigger_usd": settings.profit_lock_mid_trigger_usd,
         "profit_lock_mid_fraction": settings.profit_lock_mid_fraction,
+        "profit_lock_mature_trigger_r": settings.profit_lock_mature_trigger_r,
+        "profit_lock_mature_floor_r": settings.profit_lock_mature_floor_r,
         "profit_lock_final_trigger_usd": (
             settings.profit_lock_final_trigger_usd
         ),
+        "profit_lock_final_trigger_r": settings.profit_lock_final_trigger_r,
         "profit_lock_final_floor_usd": settings.profit_lock_final_floor_usd,
+        "profit_lock_final_max_floor_r": (
+            settings.profit_lock_final_max_floor_r
+        ),
+        "profit_lock_final_fallback_only": (
+            settings.profit_lock_final_fallback_only
+        ),
         "profit_giveback_enabled": settings.profit_giveback_enabled,
+        "profit_retention_enabled": settings.profit_retention_enabled,
+        "profit_retention_trigger_usd": settings.profit_retention_trigger_usd,
+        "profit_retention_trigger_r": settings.profit_retention_trigger_r,
+        "profit_retention_keep_fraction": settings.profit_retention_keep_fraction,
+        "profit_retention_mature_trigger_r": settings.profit_retention_mature_trigger_r,
+        "profit_retention_mature_keep_fraction": settings.profit_retention_mature_keep_fraction,
+        "profit_retention_min_headroom_usd": settings.profit_retention_min_headroom_usd,
         "profit_giveback_trigger_r": settings.profit_giveback_trigger_r,
         "profit_giveback_close_min_r": (
             settings.profit_giveback_close_min_r
@@ -594,8 +618,10 @@ async def save_config(body: dict):
             "PROFIT_LOCK_ENABLED", "PROFIT_LOCK_TRIGGER_R",
             "PROFIT_LOCK_TRIGGER_USD", "PROFIT_LOCK_FLOOR_USD",
             "PROFIT_LOCK_MID_TRIGGER_R", "PROFIT_LOCK_MID_TRIGGER_USD",
-            "PROFIT_LOCK_MID_FRACTION", "PROFIT_LOCK_FINAL_TRIGGER_USD",
-            "PROFIT_LOCK_FINAL_FLOOR_USD",
+            "PROFIT_LOCK_MID_FRACTION", "PROFIT_LOCK_MATURE_TRIGGER_R",
+            "PROFIT_LOCK_MATURE_FLOOR_R", "PROFIT_LOCK_FINAL_TRIGGER_USD",
+            "PROFIT_LOCK_FINAL_TRIGGER_R", "PROFIT_LOCK_FINAL_FLOOR_USD",
+            "PROFIT_LOCK_FINAL_MAX_FLOOR_R", "PROFIT_LOCK_FINAL_FALLBACK_ONLY",
             "PROFIT_GIVEBACK_ENABLED", "PROFIT_GIVEBACK_TRIGGER_R",
             "PROFIT_GIVEBACK_CLOSE_MIN_R",
             "PROFIT_GIVEBACK_TRIGGER_USD", "PROFIT_GIVEBACK_FRACTION",
@@ -615,6 +641,7 @@ async def save_config(body: dict):
             "ENTRY_MIN_H4_ADX",
             "OVEREXTENSION_RSI_HIGH", "OVEREXTENSION_RSI_LOW",
             "ENTRY_REQUIRE_ADX_RISING", "SAME_THESIS_REENTRY_MIN_BARS",
+            "SAME_THESIS_PROFIT_REENTRY_MIN_BARS",
             "RETEST_CONTINUATION_ENABLED", "RETEST_MIN_RESUMPTION_ATR",
             "ANALYSIS_HISTORY_BARS", "MAX_TICK_AGE_SECONDS",
             "LOSS_STREAK_PAUSE_HOURS",
@@ -657,6 +684,7 @@ async def save_config(body: dict):
             "OVEREXTENSION_RSI_HIGH": (50.0, 100.0),
             "OVEREXTENSION_RSI_LOW": (0.0, 50.0),
             "SAME_THESIS_REENTRY_MIN_BARS": (1, 24),
+            "SAME_THESIS_PROFIT_REENTRY_MIN_BARS": (1, 24),
             "RETEST_MIN_RESUMPTION_ATR": (0.01, 1.5),
             "MAX_DAILY_LOSS_USD": (0.01, 100000.0), "MAX_DAILY_LOSS_PCT": (0.0, 20.0),
             "MAX_PORTFOLIO_RISK_PCT": (0.1, 20.0), "MAX_MARGIN_USAGE_PCT": (5.0, 90.0),
@@ -674,8 +702,12 @@ async def save_config(body: dict):
             "PROFIT_LOCK_MID_TRIGGER_R": (0.1, 10.0),
             "PROFIT_LOCK_MID_TRIGGER_USD": (0.01, 100000.0),
             "PROFIT_LOCK_MID_FRACTION": (0.05, 0.95),
+            "PROFIT_LOCK_MATURE_TRIGGER_R": (0.1, 10.0),
+            "PROFIT_LOCK_MATURE_FLOOR_R": (0.05, 0.95),
             "PROFIT_LOCK_FINAL_TRIGGER_USD": (0.01, 100000.0),
+            "PROFIT_LOCK_FINAL_TRIGGER_R": (0.1, 10.0),
             "PROFIT_LOCK_FINAL_FLOOR_USD": (0.0, 100000.0),
+            "PROFIT_LOCK_FINAL_MAX_FLOOR_R": (0.05, 0.95),
             "PROFIT_GIVEBACK_TRIGGER_R": (0.1, 10.0),
             "PROFIT_GIVEBACK_CLOSE_MIN_R": (0.1, 10.0),
             "PROFIT_GIVEBACK_TRIGGER_USD": (0.0, 100000.0),
@@ -699,6 +731,7 @@ async def save_config(body: dict):
             "LOCAL_LLM_CONTEXT_SIZE", "LLM_MAX_CONCURRENCY", "MAX_ORDER_DEVIATION_POINTS",
             "DYNAMIC_MARKET_MAX_SYMBOLS",
             "SAME_THESIS_REENTRY_MIN_BARS",
+            "SAME_THESIS_PROFIT_REENTRY_MIN_BARS",
             "FAILED_THESIS_REVERSAL_MAX_AGE_BARS",
         }
         for key, bounds in numeric_ranges.items():
@@ -737,16 +770,40 @@ async def save_config(body: dict):
                 settings.profit_lock_mid_trigger_usd,
             )
         )
+        mature_trigger_r = float(
+            updates.get(
+                "PROFIT_LOCK_MATURE_TRIGGER_R",
+                settings.profit_lock_mature_trigger_r,
+            )
+        )
+        mature_floor_r = float(
+            updates.get(
+                "PROFIT_LOCK_MATURE_FLOOR_R",
+                settings.profit_lock_mature_floor_r,
+            )
+        )
         final_trigger_usd = float(
             updates.get(
                 "PROFIT_LOCK_FINAL_TRIGGER_USD",
                 settings.profit_lock_final_trigger_usd,
             )
         )
+        final_trigger_r = float(
+            updates.get(
+                "PROFIT_LOCK_FINAL_TRIGGER_R",
+                settings.profit_lock_final_trigger_r,
+            )
+        )
         final_floor_usd = float(
             updates.get(
                 "PROFIT_LOCK_FINAL_FLOOR_USD",
                 settings.profit_lock_final_floor_usd,
+            )
+        )
+        final_max_floor_r = float(
+            updates.get(
+                "PROFIT_LOCK_FINAL_MAX_FLOOR_R",
+                settings.profit_lock_final_max_floor_r,
             )
         )
         if first_floor_usd >= first_trigger_usd:
@@ -769,15 +826,27 @@ async def save_config(body: dict):
                 },
                 status_code=422,
             )
+        if mature_trigger_r < mid_trigger_r or mature_floor_r >= mature_trigger_r:
+            return JSONResponse(
+                {
+                    "error": (
+                        "Mature profit-lock trigger must follow the mid tier "
+                        "and remain above its protected R floor"
+                    )
+                },
+                status_code=422,
+            )
         if (
             final_trigger_usd < mid_trigger_usd
             or final_floor_usd >= final_trigger_usd
+            or final_trigger_r < first_trigger_r
+            or final_max_floor_r >= final_trigger_r
         ):
             return JSONResponse(
                 {
                     "error": (
-                        "Final profit-lock trigger must follow the mid tier "
-                        "and remain above its protected floor"
+                        "Final profit-lock USD/R triggers must follow the first "
+                        "tier and remain above their protected floors"
                     )
                 },
                 status_code=422,
@@ -814,14 +883,17 @@ async def save_config(body: dict):
             )
         if (
             "LOCAL_LLM_REQUIRED_QUANTIZATION" in updates
-            and updates["LOCAL_LLM_REQUIRED_QUANTIZATION"].upper()
-            not in LOCAL_LLM_QUANTIZATION_PROFILES
+            and updates["LOCAL_LLM_REQUIRED_QUANTIZATION"].strip()
+            and not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}",
+                updates["LOCAL_LLM_REQUIRED_QUANTIZATION"].strip(),
+            )
         ):
             return JSONResponse(
                 {
                     "error": (
                         "LOCAL_LLM_REQUIRED_QUANTIZATION must be "
-                        "AUTO, Q4_K_M, Q6_K, or Q8_0"
+                        "AUTO or a quantization name reported by LM Studio"
                     )
                 },
                 status_code=422,
@@ -839,6 +911,7 @@ async def save_config(body: dict):
             "RETEST_CONTINUATION_ENABLED",
             "FAST_EXIT_REVIEW_ENABLED",
             "MICRO_PROFIT_PROTECTION_ENABLED", "PROFIT_LOCK_ENABLED",
+            "PROFIT_LOCK_FINAL_FALLBACK_ONLY",
             "PROFIT_GIVEBACK_ENABLED",
         }
         invalid_boolean = next(
