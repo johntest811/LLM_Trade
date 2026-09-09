@@ -616,25 +616,10 @@ class MT5OrderExecutor:
             )
 
         # --- Quote / spread ---
-        # A typed operator override may accept the current spread, but never a
-        # missing or stale quote. Automatic orders retain the spread policy.
-        if operator_override:
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                return ExecutionResult(False, None, None, None, "[Quote] Cannot fetch live quote")
-            tick_age = broker_tick_age_seconds(
-                float(getattr(tick, "time", 0.0) or 0.0),
-                symbol=symbol,
-            )
-            if not math.isfinite(tick_age) or tick_age > settings.max_tick_age_seconds:
-                return ExecutionResult(
-                    False, None, None, None,
-                    f"[Quote] Live quote is stale ({tick_age:.1f}s old)",
-                )
-        else:
-            err = self._validate_spread(symbol, action=action, stop_loss=sl_price)
-            if err:
-                return ExecutionResult(False, None, None, None, f"[Spread] {err}")
+        # Human direction confirmation cannot bypass final quote/cost limits.
+        err = self._validate_spread(symbol, action=action, stop_loss=sl_price)
+        if err:
+            return ExecutionResult(False, None, None, None, f"[Spread] {err}")
 
         # --- Lot ---
         err = self._validate_lot(symbol, lot)
@@ -719,7 +704,7 @@ class MT5OrderExecutor:
                     f"${risk_estimate.configured_cost_usd:.2f} configured costs), above "
                     f"${risk_budget:.2f} budget",
                 )
-            if tp and not operator_override:
+            if tp:
                 final_reward = mt5.order_calc_profit(
                     order_type,
                     symbol,

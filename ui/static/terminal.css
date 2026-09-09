@@ -440,6 +440,7 @@ main { width: min(1680px, 100%); margin: 0 auto; padding: 18px 20px 44px; }
 .spread-health::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 .spread-health.warn::before { background: var(--amber); }
 .spread-health.bad::before { background: var(--red); }
+.spread-health.unknown::before { background: var(--text-2); }
 .freshness.stale { color: var(--amber); }
 
 .tabs { display: flex; gap: 3px; }
@@ -724,6 +725,9 @@ main { width: min(1680px, 100%); margin: 0 auto; padding: 18px 20px 44px; }
   html { scroll-behavior: auto; }
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+
+.research-watch { color: var(--text-2); font-size: .7rem; padding: .35rem 0; }
+.research-watch[hidden] { display: none; }
 
 @media (prefers-contrast: more) {
   :root { --line: #466078; --line-strong: #66819a; --text-2: #b2c0cd; }

@@ -12,6 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app_config.settings import settings
 from core.entry_momentum import aligned_structure_allows_adx_decline
+from core.continuation_quality import continuation_entry_check
+from risk.budget import risk_capital, daily_loss_limit, entry_risk_budget
+from core.live_reversal import (
+    qualify_live_reversal, live_reversal_plan, live_reversal_risk_percent, LIVE_REVERSAL_MIN_CONFIDENCE,
+)
 from risk.execution_costs import estimate_execution_risk
 from risk.instruments import analysis_atr_price, analysis_is_crypto, downside_risk_usd, is_crypto_symbol, validate_spread
 
@@ -289,6 +294,13 @@ class RiskManager:
         h4_analysis: Optional[Dict[str, Any]],
     ) -> str:
         """Deterministically label model directions for downstream risk rules."""
+        reversal = qualify_live_reversal(dict(zip(
+            ("M5", "M15", "H1", "H4"),
+            (m5_analysis, m15_analysis, h1_analysis, h4_analysis),
+        )), config=settings)
+        if reversal["eligible"] and reversal["direction"] == str(action).upper():
+            # Supplied model metadata cannot disguise this as a less restricted mode.
+            return "LOCAL_REVERSAL"
         supplied = str(
             (llm_decision.get("_strategy") or {}).get("mode", "")
         ).upper()
@@ -299,6 +311,8 @@ class RiskManager:
         }
         if supplied in allowed:
             return supplied
+        if supplied == "LOCAL_REVERSAL":
+            return supplied  # Rejected by final qualification if absent/disabled.
         if (
             supplied == "FAILED_THESIS_REVERSAL"
             and str(
@@ -550,6 +564,16 @@ class RiskManager:
             "H4": direction(h4_analysis),
         }
         range_mode = str(strategy_mode).upper() == "RANGE_REVERSION"
+        local_reversal = str(strategy_mode).upper() == "LOCAL_REVERSAL"
+        if local_reversal:
+            reversal = qualify_live_reversal(dict(zip(
+                ("M5", "M15", "H1", "H4"),
+                (m5_analysis, m15_analysis, h1_analysis, h4_analysis),
+            )), config=settings, now=(datetime.now(timezone.utc) if market_snapshot is not None else None))
+            if not reversal["eligible"] or reversal["direction"] != str(action).upper():
+                return False, "REJECTED [Local Reversal]: " + reversal["reason"]
+            if not math.isfinite(decision_confidence) or decision_confidence < LIVE_REVERSAL_MIN_CONFIDENCE:
+                return False, "REJECTED [Local Reversal]: Actual model confidence must be at least 85%."
         failed_thesis_reversal = (
             str(strategy_mode).upper() == "FAILED_THESIS_REVERSAL"
         )
@@ -598,6 +622,7 @@ class RiskManager:
                 and str(strategy_mode).upper() in {
                     "CONFIRMED_REVERSAL",
                     "FAILED_THESIS_REVERSAL",
+                    "LOCAL_REVERSAL",
                 }
             ):
                 continue
@@ -625,6 +650,13 @@ class RiskManager:
             isinstance(retest, dict)
             and str(retest.get("direction", "")).upper() == expected
         )
+        if settings.continuation_entry_guard_enabled and str(strategy_mode).upper() == "TREND_CONTINUATION":
+            confirmed, detail = continuation_entry_check(
+                str(action).upper(), m5_analysis,
+                min_clearance_atr=settings.continuation_min_clearance_atr,
+            )
+            if not confirmed:
+                return False, "REJECTED [Continuation Confirmation]: " + detail
         m15_events = [
             event
             for event in structure(m15_analysis).get("structure_events", [])
@@ -747,6 +779,7 @@ class RiskManager:
             or has_breakout
             or has_retest
             or has_range_trigger
+            or local_reversal
         ):
             return (
                 False,
@@ -756,6 +789,7 @@ class RiskManager:
             )
         if (
             not range_mode
+            and not local_reversal
             and has_choch
             and not has_confirmed_choch
             and not has_bos
@@ -772,6 +806,7 @@ class RiskManager:
         # must not invalidate an independently valid setup.
         breakout_only = (
             has_breakout
+            and not local_reversal
             and not has_bos
             and not has_confirmed_choch
             and not has_retest
@@ -1367,7 +1402,11 @@ class RiskManager:
         )
         has_new_range = bool(range_time is not None and range_time > closed_at)
 
-        has_new_trigger = bool(new_events or has_new_retest or has_new_range)
+        has_new_local_reversal = bool(
+            live_reversal_plan(m5_analysis, normalized_action, config=settings)
+            and analysis_time is not None and analysis_time > closed_at
+        )
+        has_new_trigger = bool(new_events or has_new_retest or has_new_range or has_new_local_reversal)
         cooldown_pending = bool(
             analysis_time is None or analysis_time < minimum_ready
         )
@@ -1515,9 +1554,9 @@ class RiskManager:
                         f"qualification failed ({reversal_detail})."
                     ),
                 )
-        if strategy_mode and not str(
+        if strategy_mode == "LOCAL_REVERSAL" or (strategy_mode and not str(
             (llm_decision.get("_strategy") or {}).get("mode", "")
-        ).strip():
+        ).strip()):
             llm_decision = dict(llm_decision)
             llm_decision["_strategy"] = {
                 "mode": strategy_mode,
@@ -1776,6 +1815,7 @@ class RiskManager:
             symbol,
             trade_history,
             losing_streak=losing_streak,
+            risk_pct_override=(live_reversal_risk_percent(settings) if strategy_mode == "LOCAL_REVERSAL" else None),
         )
         if lot is None:
             return reject(msg)
@@ -1825,14 +1865,7 @@ class RiskManager:
         market_snapshot: Any,
         trade_history: List[Dict[str, Any]],
     ) -> RiskValidationResult:
-        """Size an explicitly confirmed operator override at broker minimum.
-
-        This path deliberately bypasses project strategy and risk-policy gates.
-        The engine and executor still enforce current decision/account identity,
-        valid broker volume and SL/TP, quote freshness, available broker margin,
-        and MT5 ``order_check`` immediately before submission. Automatic entry
-        validation is unchanged.
-        """
+        """Manual direction approval cannot bypass capital or broker safety."""
         action = str(action).upper()
 
         def reject(reason: str) -> RiskValidationResult:
@@ -1840,6 +1873,20 @@ class RiskManager:
 
         if action not in {"BUY", "SELL"}:
             return reject("Manual override requires a BUY or SELL candidate")
+
+        for check, args in (
+            (self._check_spread, (symbol, market_snapshot, decision)),
+            (self._check_max_positions, (open_positions,)),
+            (self._check_duplicate, (symbol, action, open_positions)),
+            (self._check_daily_loss, (account_info,)),
+            (self._check_drawdown, (account_info,)),
+            (self._check_free_margin, (account_info,)),
+            (self._check_margin_level, (account_info,)),
+            (self._check_margin_usage, (account_info,)),
+        ):
+            allowed, detail = check(*args)
+            if not allowed:
+                return reject(detail)
 
         lot, reason, sizing = self._compute_lot_size(
             decision,
@@ -1851,13 +1898,24 @@ class RiskManager:
             apply_streak_scaling=False,
             force_minimum_lot=True,
             enforce_profit_objective=False,
+            risk_pct_override=min(settings.risk_percent, settings.manual_override_max_risk_pct),
         )
         if lot is None:
             return reject(reason)
 
+        if sizing["rr"] + 1e-9 < settings.min_risk_reward_ratio:
+            return reject("REJECTED [Manual Net R:R]: The technical target cannot support the required net reward/risk.")
+        for check, args in (
+            (self._check_portfolio_risk, (account_info, open_positions, sizing["risk_usd"])),
+            (self._check_margin_for_lot, (account_info, lot, symbol, action)),
+        ):
+            allowed, detail = check(*args)
+            if not allowed:
+                return reject(detail)
+
         return RiskValidationResult(
             approved=True,
-            reason="Operator override sized at the broker minimum volume.",
+            reason="Operator direction confirmed; broker minimum fits all hard risk limits.",
             adjusted_lot=lot,
             estimated_risk_usd=sizing["risk_usd"],
             estimated_reward_usd=sizing["reward_usd"],
@@ -2071,21 +2129,16 @@ class RiskManager:
     def daily_loss_status(self, account_info: Dict[str, Any]) -> Tuple[bool, str]:
         """Return the current UTC-day loss gate and a dashboard-safe summary."""
         self._maybe_reset_daily(datetime.now(timezone.utc))
-        balance = float(account_info.get("balance", 0.0) or 0.0)
-        percent_limit = balance * settings.max_daily_loss_pct / 100.0
-        limits = [
-            limit
-            for limit in (settings.max_daily_loss_usd, percent_limit)
-            if limit > 0
-        ]
-        effective_limit = min(limits) if limits else 0.0
-        if effective_limit and self._daily_loss_usd >= effective_limit:
+        effective_limit = daily_loss_limit(account_info, settings)
+        if effective_limit <= 0:
+            return False, "Daily budget unavailable: valid balance/equity and limits required."
+        if self._daily_loss_usd >= effective_limit:
             return (
                 False,
                 f"Gross losses ${self._daily_loss_usd:.2f} / ${effective_limit:.2f}; "
                 "new entries resume after the UTC daily reset",
             )
-        if effective_limit:
+        if math.isfinite(effective_limit):
             return True, f"${self._daily_loss_usd:.2f} / ${effective_limit:.2f}"
         return True, "No daily loss limit configured"
 
@@ -2232,11 +2285,10 @@ class RiskManager:
 
     def _check_daily_loss(self, account_info: Dict[str, Any]) -> Tuple[bool, str]:
         """Rule 7 — Maximum daily loss in USD."""
-        balance = float(account_info.get("balance", 0.0) or 0.0)
-        percent_limit = balance * settings.max_daily_loss_pct / 100.0
-        limits = [limit for limit in (settings.max_daily_loss_usd, percent_limit) if limit > 0]
-        effective_limit = min(limits) if limits else 0.0
-        if effective_limit and self._daily_loss_usd >= effective_limit:
+        effective_limit = daily_loss_limit(account_info, settings)
+        if effective_limit <= 0:
+            return False, "REJECTED [Daily Loss Limit]: Valid balance/equity and risk limits are required."
+        if self._daily_loss_usd >= effective_limit:
             return (
                 False,
                 f"REJECTED [Daily Loss Limit]: Daily loss of ${self._daily_loss_usd:.2f} "
@@ -2320,7 +2372,12 @@ class RiskManager:
 
     def _check_free_margin(self, account_info: Dict[str, Any]) -> Tuple[bool, str]:
         """Rule 10 — Minimum free margin in USD."""
-        free_margin = account_info.get("margin_free", 0.0)
+        try:
+            free_margin = float(account_info["margin_free"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, "REJECTED [Free Margin]: Valid free margin is required."
+        if not math.isfinite(free_margin):
+            return False, "REJECTED [Free Margin]: Valid free margin is required."
         if free_margin < settings.min_free_margin_usd:
             return (
                 False,
@@ -2331,9 +2388,15 @@ class RiskManager:
 
     def _check_margin_level(self, account_info: Dict[str, Any]) -> Tuple[bool, str]:
         """Rule 11 — Minimum margin level percentage."""
-        margin_level = account_info.get("margin_level", 0.0)
+        try:
+            margin_level = float(account_info["margin_level"])
+            margin = float(account_info.get("margin", 0.0))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, "REJECTED [Margin Level]: Valid margin data is required."
+        if not all(math.isfinite(v) and v >= 0 for v in (margin_level, margin)):
+            return False, "REJECTED [Margin Level]: Valid margin data is required."
         # margin_level of 0 typically means no open positions (infinite margin)
-        if margin_level == 0.0:
+        if margin_level == 0.0 and margin == 0.0:
             return True, ""
         if margin_level < settings.min_margin_level_pct:
             return (
@@ -2345,10 +2408,13 @@ class RiskManager:
 
     def _check_margin_usage(self, account_info: Dict[str, Any]) -> Tuple[bool, str]:
         """Reject new exposure when existing margin use is already too high."""
-        equity = float(account_info.get("equity", 0.0) or 0.0)
-        margin = float(account_info.get("margin", 0.0) or 0.0)
-        if equity <= 0:
-            return False, "REJECTED [Margin Usage]: Account equity is unavailable."
+        try:
+            equity = float(account_info["equity"])
+            margin = float(account_info.get("margin", 0.0))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, "REJECTED [Margin Usage]: Valid equity and margin are required."
+        if not all(math.isfinite(v) for v in (equity, margin)) or equity <= 0 or margin < 0:
+            return False, "REJECTED [Margin Usage]: Valid equity and margin are required."
         usage = margin / equity * 100.0
         if usage >= settings.max_margin_usage_pct:
             return (
@@ -2433,9 +2499,10 @@ class RiskManager:
             "rr": 0.0,
             "risk_budget_usd": 0.0,
         }
-        balance = float(account_info.get("balance", 0.0) or 0.0)
-        if balance <= 0:
-            return None, "REJECTED [Lot Sizing]: Account balance is zero.", empty
+        capital = risk_capital(account_info)
+        if capital <= 0:
+            return None, "REJECTED [Lot Sizing]: Valid positive account balance and equity are required.", empty
+        balance = float(account_info["balance"])
 
         # Validation passes its already-computed value so the quality and
         # sizing gates cannot disagree at the exact expiry boundary.  Direct
@@ -2455,8 +2522,11 @@ class RiskManager:
             if risk_pct_override is not None
             else settings.risk_percent
         )
+        if str((llm_decision.get("_strategy") or {}).get("mode", "")).upper() == "LOCAL_REVERSAL":
+            risk_pct = min(risk_pct, live_reversal_risk_percent(settings))
         if not math.isfinite(risk_pct) or risk_pct <= 0:
             return None, "REJECTED [Lot Sizing]: Risk percentage is invalid.", empty
+        configured_risk_ceiling = risk_pct
         
         # Automatic entries scale down after losses. A manually confirmed
         # rejected trade instead uses the configured per-trade ceiling, so a
@@ -2472,11 +2542,12 @@ class RiskManager:
             risk_pct = 0.1
             logger.info("Adaptive Risk: Streak >= 2. Clamping risk to minimum 0.1% for capital preservation.")
 
-        risk_budget = balance * risk_pct / 100.0
-        if settings.auto_close_loss_enabled and settings.auto_close_loss_usd > 0:
-            risk_budget = min(risk_budget, settings.auto_close_loss_usd)
+        # A safety reduction's 0.1% floor must never increase an operator's
+        # smaller configured cap (or this strategy's explicit override).
+        risk_pct = min(risk_pct, configured_risk_ceiling)
+        risk_budget = entry_risk_budget(account_info, settings, risk_percent=risk_pct, daily_loss=self._daily_loss_usd)
         if not math.isfinite(risk_budget) or risk_budget <= 0:
-            return None, "REJECTED [Lot Sizing]: Risk budget is invalid.", empty
+            return None, "REJECTED [Lot Sizing]: Entry or remaining daily risk budget is exhausted or invalid.", empty
 
         action = str(llm_decision.get("action", "")).upper()
         sl = llm_decision.get("stop_loss")
@@ -2507,7 +2578,7 @@ class RiskManager:
         )
         if min_estimate is None:
             return None, "REJECTED [Lot Sizing]: MT5 could not calculate execution-adjusted stop risk.", empty
-        if not force_minimum_lot and min_estimate.total_risk_usd > risk_budget + 1e-9:
+        if min_estimate.total_risk_usd > risk_budget + 1e-9:
             actual_pct = min_estimate.total_risk_usd / balance * 100.0
             return (
                 None,
@@ -2524,13 +2595,8 @@ class RiskManager:
         if force_minimum_lot:
             lot = min_lot
             final_estimate = min_estimate
-            # The executor re-estimates at the final quote. Keep a small,
-            # explicit buffer for a tick changing between preview and send.
-            risk_budget = max(
-                risk_budget,
-                min_estimate.total_risk_usd
-                + max(0.01, min_estimate.total_risk_usd * 0.05),
-            )
+            # A human confirmation may choose minimum volume, never enlarge
+            # the budget. The executor rejects adverse quote drift over it.
         else:
             # Find the largest broker step whose worst allowed fill, stop loss and
             # configured round-turn costs all fit inside the budget. Binary search
@@ -2608,9 +2674,11 @@ class RiskManager:
         open_positions: List[Dict[str, Any]],
         proposed_risk_usd: float,
     ) -> Tuple[bool, str]:
-        balance = float(account_info.get("balance", 0.0) or 0.0)
+        balance = risk_capital(account_info)
         if balance <= 0:
-            return False, "REJECTED [Portfolio Risk]: Balance is unavailable."
+            return False, "REJECTED [Portfolio Risk]: Valid balance and equity are required."
+        if not math.isfinite(proposed_risk_usd) or proposed_risk_usd < 0:
+            return False, "REJECTED [Portfolio Risk]: Proposed risk is invalid."
         total_risk = proposed_risk_usd
         for position in open_positions:
             sl = float(position.get("sl", 0.0) or 0.0)
@@ -2637,15 +2705,27 @@ class RiskManager:
             return (
                 False,
                 f"REJECTED [Portfolio Risk]: Stops would risk ${total_risk:.2f} "
-                f"({pct:.2f}% of balance), above {settings.max_portfolio_risk_pct:.2f}%.",
+                f"({pct:.2f}% of risk capital), above {settings.max_portfolio_risk_pct:.2f}%.",
             )
+        remaining_daily = max(0.0, daily_loss_limit(account_info, settings) - self._daily_loss_usd)
+        if total_risk > remaining_daily + 1e-9:
+            return False, f"REJECTED [Remaining Daily Risk]: Open and proposed stops risk ${total_risk:.2f}; only ${remaining_daily:.2f} of the daily budget remains."
         return True, ""
 
     def _check_margin_for_lot(
         self, account_info: Dict[str, Any], lot: float, symbol: str = "", action: str = "BUY"
     ) -> Tuple[bool, str]:
         """Rule 14 — Sanity check that free margin can cover the computed lot."""
-        free_margin = account_info.get("margin_free", 0.0)
+        try:
+            free_margin = float(account_info["margin_free"])
+            equity = float(account_info["equity"])
+            current_margin = float(account_info.get("margin", 0.0))
+            lot = float(lot)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, "REJECTED [Margin for Lot]: Valid account margin and volume are required."
+        if (not all(math.isfinite(v) for v in (free_margin, equity, current_margin, lot))
+                or free_margin < 0 or equity <= 0 or current_margin < 0 or lot <= 0):
+            return False, "REJECTED [Margin for Lot]: Valid account margin and volume are required."
         
         # 1. Try to compute using MT5 API (the most accurate way)
         symbol_info = mt5.symbol_info(symbol) if symbol else None
@@ -2659,7 +2739,7 @@ class RiskManager:
                 symbol_info.bid if order_type == mt5.ORDER_TYPE_SELL else symbol_info.ask
             )
             margin_calc = mt5.order_calc_margin(order_type, symbol, lot, current_price)
-            if margin_calc is not None and margin_calc > 0:
+            if margin_calc is not None and math.isfinite(margin_calc) and margin_calc > 0:
                 estimated_margin_needed = margin_calc
                 required_with_buffer = estimated_margin_needed * 1.05
                 if free_margin < required_with_buffer:
@@ -2669,8 +2749,6 @@ class RiskManager:
                         f"${required_with_buffer:.2f} for {lot:.2f} lot of {symbol} exceeds "
                         f"free margin ${free_margin:.2f}."
                     )
-                equity = float(account_info.get("equity", 0.0) or 0.0)
-                current_margin = float(account_info.get("margin", 0.0) or 0.0)
                 projected_usage = (
                     (current_margin + estimated_margin_needed) / equity * 100.0
                     if equity > 0 else 100.0

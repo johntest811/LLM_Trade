@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pandas as pd
 
 from core.engine import TradingEngine
-from app_config.settings import settings
+from app_config.settings import settings as runtime_settings
+
+# Model-lane cadence cases deliberately exercise the model, not the separately
+# tested deterministic fast path (test_engine_resilience.py).
+settings = replace(runtime_settings, deterministic_entry_fast_path_enabled=False)
 
 
 class _Reader:
@@ -34,7 +38,9 @@ class _Reader:
 class _Analyzer:
     def analyze(self, symbol, timeframe, candles):
         return {
-            "indicators": {"adx_14": 30.0},
+            "indicators": {"adx_14": 30.0, "adx_delta": 1.0, "current_price": 100.0,
+                           "atr_14": 1.0, "ema_9": 99.8, "ema_21": 100.0,
+                           "rsi_14": 45.0, "macd": {"diff": -.1}},
             "market_structure": {
                 "trend": "BEARISH",
                 "trend_state": "EARLY_BULLISH_REVERSAL",
@@ -42,6 +48,7 @@ class _Analyzer:
                     {
                         "type": "BOS",
                         "direction": "BEARISH",
+                        "level": 100.5,
                         "time": "2026-08-12 05:10:00+00:00",
                     }
                 ],
@@ -86,6 +93,11 @@ class _InvalidLLM(_LLM):
 
 
 class ScanCadenceTests(unittest.TestCase):
+    def setUp(self):
+        context = patch("core.engine.settings", settings)
+        context.start()
+        self.addCleanup(context.stop)
+
     def test_model_latency_excludes_serial_queue_wait(self):
         telemetry = {"trace_id": "trace-1", "latency_seconds": 3.75}
         self.assertEqual(
@@ -399,7 +411,7 @@ class ScanCadenceTests(unittest.TestCase):
             asyncio.run(engine._evaluate_symbol("USDJPY", {"balance": 15.0}, []))
         self.assertEqual(llm.calls, 0)
         self.assertFalse(engine._entry_model_admissions)
-        self.assertTrue(any(call.kwargs.get("stage") == "SETUP FILTERED" for call in update_decision.call_args_list))
+        self.assertTrue(any(call.kwargs.get("stage") == "PREFILTERED" for call in update_decision.call_args_list))
 
     def test_older_ranking_cannot_veto_a_fresh_setup_with_unused_capacity(self):
         llm = _LLM()

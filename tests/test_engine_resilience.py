@@ -51,6 +51,7 @@ class EngineResilienceTests(unittest.TestCase):
                 {
                     "type": "BOS",
                     "direction": direction,
+                    "level": 1.19 if bullish else 1.21,
                     "time": "2026-08-12T00:05:00+00:00",
                 }
             ]
@@ -58,6 +59,8 @@ class EngineResilienceTests(unittest.TestCase):
             "timestamp": "2026-08-12T00:05:00+00:00",
             "indicators": {
                 "adx_14": 30.0,
+                "current_price": 1.2,
+                "atr_14": .01,
                 "ema_9": 1.2 if bullish else 1.0,
                 "ema_21": 1.1,
                 "rsi_14": 58.0 if bullish else 42.0,

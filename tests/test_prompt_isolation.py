@@ -39,6 +39,19 @@ def _analysis(direction: str = "BEARISH") -> dict:
 
 
 class PromptIsolationTests(unittest.TestCase):
+    def test_research_watch_cannot_bias_the_live_entry_prompt(self):
+        analysis = _analysis()
+        def generate():
+            return PromptGenerator.generate(symbol="TEST", timeframe="M5", analysis_data=analysis,
+                                            m15_analysis=analysis, h1_analysis=analysis, h4_analysis=analysis,
+                                            account_info={}, open_positions=[], trade_history=[], calendar_events=None)
+        before = generate()
+        analysis["market_structure"]["reversal_watch"] = {
+            "candidate": True, "live_eligible": False, "direction": "BUY",
+            "reason": "RESEARCH_TEST_SENTINEL", "reference_price": 9,
+        }
+        self.assertEqual(generate(), before)
+
     def test_entry_direction_prompt_excludes_balance_and_prior_pnl(self):
         analysis = _analysis()
         _, prompt = PromptGenerator.generate(
@@ -135,4 +148,3 @@ class PromptIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

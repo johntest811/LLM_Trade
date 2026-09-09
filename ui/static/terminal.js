@@ -647,7 +647,7 @@ function renderPipeline(state) {
           stage: String(fit.status || "").toUpperCase() === "MARKET CLOSED" ? "MARKET CLOSED" : "STANDBY",
           action: "HOLD",
           confidence: 0,
-          gate_reason: fit.reason || "Not selected for active decision processing.",
+          gate_reason: fit.entry_prefilter_reason || fit.reason || "Not selected for active decision processing.",
           updated_at: decisions[symbol]?.updated_at || "",
         }
       : (decisions[symbol] || { symbol, stage: "WAITING", action: "—", confidence: 0 });
@@ -683,6 +683,12 @@ function renderPipeline(state) {
     mini.append(fill, marker);
     card.append(mini);
     card.append(node("div", "pipeline-reason", decision.gate_reason || decision.reasoning || "Waiting for a completed M5 candle."));
+    const researchLabel = researchWatchLabel(fit);
+    if (researchLabel) {
+      const researchNote = node("div", "research-watch", researchLabel);
+      researchNote.dataset.researchSignal = fit.research_watch.signal_time_utc;
+      card.append(researchNote);
+    }
     const meta = node("div", "pipeline-meta");
     meta.append(node("span", "", decision.inference_time_s ? `${finite(decision.inference_time_s).toFixed(2)}s ${deterministic ? "evaluation" : "inference"}` : "not evaluated"));
     const decisionTime = node("time", "", decision.updated_at ? ageLabel(decision.updated_at) : "not scanned");
@@ -776,6 +782,55 @@ function renderSparkline(svg, symbol) {
   svg.classList.toggle("down", values.at(-1) < values[0]);
 }
 
+function watchCardMetrics(quote = {}, fit = {}) {
+  const numberOrNull = (value) => value === null || value === undefined || value === ""
+    ? null : Number.isFinite(Number(value)) ? Number(value) : null;
+  const bid = numberOrNull(quote.bid);
+  const ask = numberOrNull(quote.ask);
+  const hasQuote = bid !== null && ask !== null && bid > 0 && ask >= bid;
+  const spread = hasQuote ? (numberOrNull(quote.spread_value)
+    ?? numberOrNull(quote.spread_pips) ?? numberOrNull(fit.spread_value)) : null;
+  const adx = numberOrNull(fit.selection_adx) ?? numberOrNull(quote.adx);
+  const trend = fit.selection_regime || quote.trend;
+  return {
+    hasQuote, spread: spread !== null && spread >= 0 ? spread : null, adx,
+    trend: adx === null || !trend || trend === "UNKNOWN" ? "NOT ANALYZED" : trend,
+    assetClass: fit.asset_class || quote.asset_class || "CFD",
+    unit: quote.spread_unit || fit.spread_unit || "pips",
+  };
+}
+
+function researchWatchLabel(fit = {}, now = serverNow()) {
+  const live = fit.live_reversal || {};
+  const liveTime = Date.parse(live.signal_time_utc || "");
+  if (live.eligible === true && ["BUY", "SELL"].includes(live.direction)
+      && Number.isFinite(liveTime) && now >= liveTime && now - liveTime <= 120000)
+    return `${live.direction} reversal LIVE CANDIDATE - not approved`;
+  const watch = fit.research_watch || {};
+  const signalTime = Date.parse(watch.signal_time_utc || "");
+  if (!watch.candidate || watch.live_eligible !== false || !["BUY", "SELL"].includes(watch.direction)
+      || !Number.isFinite(signalTime) || now < signalTime || now - signalTime > 300000) return "";
+  return `${watch.direction} reversal watch — RESEARCH ONLY`;
+}
+
+function expireResearchLabels(now = serverNow()) {
+  for (const item of document.querySelectorAll("[data-research-signal]")) {
+    const stamp = Date.parse(item.dataset.researchSignal || "");
+    const maxAge = String(item.textContent || "").includes("LIVE CANDIDATE") ? 120000 : 300000;
+    if (!Number.isFinite(stamp) || now < stamp || now - stamp > maxAge) item.hidden = true;
+  }
+}
+
+function quoteFreshness(quote = {}, fit = {}) {
+  const age = ageSeconds(quote.updated_at);
+  const limit = Math.max(1, finite(app.config?.max_tick_age_seconds, 10));
+  return {
+    text: quote.updated_at ? ageLabel(quote.updated_at) : (fit.status || "WAITING FOR BROKER TICK"),
+    title: fit.entry_prefilter_reason || fit.reason || "",
+    stale: !watchCardMetrics(quote, fit).hasQuote || age === null || age > limit,
+  };
+}
+
 function renderWatch(prices, ticks, fits = {}) {
   captureTicks(ticks);
   const container = $("watch");
@@ -786,7 +841,9 @@ function renderWatch(prices, ticks, fits = {}) {
   const maxTickAge = Math.max(1, finite(app.config?.max_tick_age_seconds, 10));
   const freshCount = symbols.filter((symbol) => {
     const updated = prices?.[symbol]?.updated_at;
-    return updated && finite(ageSeconds(updated), 999999) <= maxTickAge;
+    const age = ageSeconds(updated);
+    return watchCardMetrics(prices?.[symbol], fits?.[symbol]).hasQuote
+      && updated && age !== null && age <= maxTickAge;
   }).length;
   setText(
     "watch-count",
@@ -808,6 +865,7 @@ function renderWatch(prices, ticks, fits = {}) {
   for (const symbol of symbols) {
     const quote = prices[symbol] || {};
     const fit = fits[symbol] || {};
+    const metrics = watchCardMetrics(quote, fit);
     let card = app.quoteCards.get(symbol);
     if (!card) {
       card = createQuoteCard(symbol);
@@ -815,33 +873,36 @@ function renderWatch(prices, ticks, fits = {}) {
       container.append(card);
     }
     card.querySelector(".quote-symbol").textContent = symbol;
-    card.querySelector(".quote-asset").textContent = quote.asset_class || fit.asset_class || "FX/CFD";
-    card.querySelector(".quote-trend").textContent = `Trend ${quote.trend || fit.selection_regime || "—"}`;
-    card.querySelector(".quote-adx").textContent = `ADX ${finite(quote.adx, finite(fit.selection_adx)).toFixed(0)}`;
+    card.querySelector(".quote-asset").textContent = metrics.assetClass;
+    card.querySelector(".quote-trend").textContent = `Trend ${metrics.trend}`;
+    card.querySelector(".quote-adx").textContent = `ADX ${metrics.adx === null ? "—" : metrics.adx.toFixed(0)}`;
+    let researchNode = card.querySelector(".research-watch");
+    if (!researchNode) {
+      researchNode = node("div", "research-watch");
+      card.append(researchNode);
+    }
+    researchNode.textContent = researchWatchLabel(fit);
+    researchNode.hidden = !researchNode.textContent;
+    researchNode.title = fit.research_watch?.reason || "";
+    researchNode.dataset.researchSignal = fit.research_watch?.signal_time_utc || "";
 
     // Intentional user-requested presentation only. Broker execution remains BUY at ASK / SELL at BID.
     flashValue(card.querySelector(".sell-price"), quote.ask);
     flashValue(card.querySelector(".buy-price"), quote.bid);
 
-    const spread = finite(
-      quote.spread_value,
-      finite(quote.spread_pips, finite(fit.spread_value)),
-    );
-    const unit = quote.spread_unit || fit.spread_unit || "pips";
+    const { spread, unit } = metrics;
+    const quoteAge = ageSeconds(quote.updated_at);
+    const stale = !metrics.hasQuote || quoteAge === null || quoteAge > maxTickAge;
     const spreadNode = card.querySelector(".spread-health");
-    spreadNode.textContent = `spread ${spread.toFixed(1)} ${unit}`;
-    const ratio = spread / maxSpread;
-    spreadNode.className = `spread-health ${ratio > 1 ? "bad" : ratio > .7 ? "warn" : ""}`.trim();
+    spreadNode.textContent = spread === null ? "spread —" : `spread ${spread.toFixed(1)} ${unit}`;
+    const spreadLimit = unit === "bps" ? Math.max(.01, finite(app.config?.max_crypto_spread_bps, 30)) : maxSpread;
+    const ratio = spread === null ? null : spread / spreadLimit;
+    spreadNode.className = `spread-health ${spread === null || stale ? "unknown" : ratio > 1 ? "bad" : ratio > .7 ? "warn" : ""}`.trim();
     const freshness = card.querySelector(".freshness");
-    freshness.textContent = quote.updated_at
-      ? ageLabel(quote.updated_at)
-      : (fit.status || "WAITING FOR BROKER TICK");
-    freshness.classList.toggle(
-      "stale",
-      quote.updated_at
-        ? finite(ageSeconds(quote.updated_at), 999999) > maxTickAge
-        : true,
-    );
+    const fresh = quoteFreshness(quote, fit);
+    freshness.textContent = fresh.text;
+    freshness.title = fresh.title;
+    freshness.classList.toggle("stale", fresh.stale);
     renderSparkline(card.querySelector(".sparkline"), symbol);
   }
 }
@@ -1264,13 +1325,16 @@ function updateTemporalUi() {
       const card = app.quoteCards.get(symbol);
       if (!card) continue;
       const freshness = card.querySelector(".freshness");
-      freshness.textContent = quote.updated_at ? ageLabel(quote.updated_at) : "live stream";
-      freshness.classList.toggle("stale", quote.updated_at ? finite(ageSeconds(quote.updated_at), 999) > 5 : false);
+      const fresh = quoteFreshness(quote, app.state?.market_fits?.[symbol] || {});
+      freshness.textContent = fresh.text;
+      freshness.title = fresh.title;
+      freshness.classList.toggle("stale", fresh.stale);
     }
   }
   for (const item of document.querySelectorAll(".pipeline-meta time[data-timestamp]")) {
     item.textContent = ageLabel(item.dataset.timestamp);
   }
+  expireResearchLabels(now);
 }
 
 function openTradeManager(ticket) {
@@ -1377,7 +1441,7 @@ async function submitRejectedTrade(event) {
     dialog.close();
     const confirmation = await requestConfirmation({
       title: `Force open ${preview.action} ${preview.symbol}`,
-      message: `Submit one ${finite(preview.lot).toFixed(2)} lot market order while bypassing every project policy gate. Pepperstone account, quote, margin, SL/TP, and order checks remain mandatory.`,
+      message: `Submit one ${finite(preview.lot).toFixed(2)} lot market order with your direction confirmation. Account, spread, daily-loss, position-risk, margin, SL/TP, and broker checks remain mandatory.`,
       phrase: preview.confirmation_phrase,
       confirmLabel: "Force open trade",
     });

@@ -1,4 +1,8 @@
 import logging
+import copy
+import hashlib
+from collections import OrderedDict
+from threading import RLock
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -16,19 +20,33 @@ logger = logging.getLogger("TradingSystem.AnalysisEngine")
 class MarketAnalysisEngine:
     """
     Computes technical indicators and Smart Money Concepts (SMC) structural levels.
-    Uses timestamp-based caching to avoid recalculations if the latest candle hasn't closed.
+    Caches unchanged inputs, including broker history corrections and contract scale.
     """
-    def __init__(self) -> None:
-        # Structured caching: {(symbol, timeframe): (last_candle_timestamp, analysis_dict)}
-        self._cache: Dict[Tuple[str, str], Tuple[datetime, Dict[str, Any]]] = {}
-        self._previous_cache: Dict[Tuple[str, str], Tuple[datetime, Dict[str, Any]]] = {}
+    def __init__(self, *, max_cache_entries: int = 2048) -> None:
+        if max_cache_entries < 1:
+            raise ValueError("max_cache_entries must be positive")
+        self._cache = OrderedDict()
+        self._previous_cache = {}
+        self._cache_limit = max_cache_entries
+        self._cache_lock = RLock()
+
+    @staticmethod
+    def _input_signature(frame: pd.DataFrame) -> bytes:
+        # A timestamp alone misses backfills, corrected OHLC/volume, and broker
+        # contract changes. Hashing ~220 rows is much cheaper than SMC analysis.
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(pd.util.hash_pandas_object(frame, index=False).values.tobytes())
+        digest.update(repr((tuple(frame.columns), tuple(map(str, frame.dtypes)),
+                            frame.attrs.get("pip_size"), frame.attrs.get("asset_class"),
+                            settings.breakout_min_displacement_atr)).encode())
+        return digest.digest()
 
     def analyze(self, symbol: str, timeframe: str, df_candles: pd.DataFrame) -> Optional[Dict[str, Any]]:
         """
         Runs the full analysis pipeline on the provided historical DataFrame.
         Returns a clean structured dictionary ready for direct LLM ingestion.
         """
-        if df_candles.empty or len(df_candles) < 25:
+        if df_candles.empty or len(df_candles) < 25 or df_candles.attrs.get("is_stale", False):
             logger.warning(f"Insufficient candle count ({len(df_candles)}) to run analysis for {symbol}")
             return None
 
@@ -41,15 +59,13 @@ class MarketAnalysisEngine:
         latest_time = latest_candle['time']
         
         cache_key = (symbol.upper(), timeframe.upper())
-        cached_record = self._cache.get(cache_key)
-        
-        # 1. Skip calculations if latest candle is already cached
-        if cached_record and cached_record[0] == latest_time:
-            logger.debug(f"Cache hit: Skip recalculating unchanged candles for {symbol} ({timeframe})")
-            return cached_record[1]
-        previous_record = self._previous_cache.get(cache_key)
-        if previous_record and previous_record[0] == latest_time:
-            return previous_record[1]
+        signature = self._input_signature(df_candles)
+        with self._cache_lock:
+            for record in (self._cache.get(cache_key), self._previous_cache.get(cache_key)):
+                if record and record[0] == latest_time and record[1] == signature:
+                    self._cache.move_to_end(cache_key)
+                    # Caller annotations must never contaminate another lane.
+                    return copy.deepcopy(record[2])
 
         logger.info(f"Running full market and SMC analysis for {symbol} ({timeframe})...")
 
@@ -233,11 +249,17 @@ class MarketAnalysisEngine:
         }
 
         # Save to cache
-        cached_record = self._cache.get(cache_key)
-        if cached_record and latest_time < cached_record[0]:
-            self._previous_cache[cache_key] = (latest_time, analysis)
-        else:
-            if cached_record and latest_time > cached_record[0]:
-                self._previous_cache[cache_key] = cached_record
-            self._cache[cache_key] = (latest_time, analysis)
+        with self._cache_lock:
+            cached_record = self._cache.get(cache_key)
+            record = (latest_time, signature, copy.deepcopy(analysis))
+            if cached_record and latest_time < cached_record[0]:
+                self._previous_cache[cache_key] = record
+            else:
+                if cached_record and latest_time > cached_record[0]:
+                    self._previous_cache[cache_key] = cached_record
+                self._cache[cache_key] = record
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > self._cache_limit:
+                evicted, _ = self._cache.popitem(last=False)
+                self._previous_cache.pop(evicted, None)
         return analysis

@@ -37,6 +37,26 @@ class TradeReplayLogger:
             conn.execute("PRAGMA busy_timeout=10000")
             cursor = conn.cursor()
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scan_observation (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at_utc TEXT NOT NULL,
+                    account_scope TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    candle_time TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    config_fingerprint TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_scan_observation_account_symbol
+                ON scan_observation(account_scope, symbol, id DESC)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_scan_observation_time
+                ON scan_observation(observed_at_utc)
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS trade_replay (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     time TEXT NOT NULL,
@@ -183,6 +203,75 @@ class TradeReplayLogger:
         finally:
             if conn is not None:
                 conn.close()
+
+    def log_scan_observations(
+        self, account_scope: str, lane: str, observations: List[Dict[str, Any]]
+    ) -> bool:
+        """Batch account-scoped scan reasons, including candidates never sent to an LLM."""
+        if not observations:
+            return True
+        now = datetime.now(timezone.utc)
+        try:
+            values = [(
+                now.isoformat(), account_scope, str(row["symbol"]).upper(),
+                str(row.get("opportunity_bar") or "UNAVAILABLE"), lane,
+                settings.config_fingerprint,
+                json.dumps(row, allow_nan=False, default=str),
+            ) for row in observations]
+            with closing(sqlite3.connect(self.db_path, timeout=1.0)) as conn:
+                conn.executemany("""
+                    INSERT INTO scan_observation (
+                        observed_at_utc, account_scope, symbol, candle_time,
+                        lane, config_fingerprint, snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, values)
+                # Bound only the new diagnostic history. Never prune trades,
+                # broker records, model decisions, or shadow outcomes here.
+                cutoff = (now - timedelta(days=settings.scan_audit_retention_days)).isoformat()
+                conn.execute("DELETE FROM scan_observation WHERE observed_at_utc < ?", (cutoff,))
+                conn.execute("""
+                    DELETE FROM scan_observation WHERE id <= (
+                        SELECT id FROM scan_observation ORDER BY id DESC LIMIT 1 OFFSET ?
+                    )
+                """, (settings.scan_audit_max_rows,))
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.warning("Scan-audit write failed: %s", exc)
+            return False
+
+    def get_scan_observations(
+        self, account_scope: str, symbol: str = "", limit: int = 50,
+        before_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Read diagnostic history for one exact account, newest first."""
+        limit = max(1, min(200, int(limit)))
+        clause = " AND symbol = ?" if symbol else ""
+        params = [account_scope, symbol.upper()] if symbol else [account_scope]
+        if before_id is not None:
+            if int(before_id) <= 0:
+                raise ValueError("before_id must be positive")
+            clause += " AND id < ?"
+            params.append(int(before_id))
+        params.append(limit)
+        from pathlib import Path
+        uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, observed_at_utc, symbol, candle_time, lane, "
+                "config_fingerprint, snapshot_json FROM scan_observation "
+                "WHERE account_scope = ?" + clause + " ORDER BY id DESC LIMIT ?", params,
+            ).fetchall()
+        result = []
+        import hashlib
+        scope_id = hashlib.sha256(account_scope.encode("utf-8")).hexdigest()[:16]
+        for row in rows:
+            item = dict(row)
+            item["account_scope_id"] = scope_id
+            item["snapshot"] = json.loads(item.pop("snapshot_json"))
+            result.append(item)
+        return result
 
     def log_shadow_candidate(
         self,

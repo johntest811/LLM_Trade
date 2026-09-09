@@ -296,7 +296,7 @@
           <div><dt>Net R:R</dt><dd id="rejected-rr">—</dd></div>
           <div><dt>Projected margin</dt><dd id="rejected-margin">—</dd></div>
         </dl>
-        <div class="override-safety"><strong>Project protections bypassed</strong><span>This force order bypasses confidence, ADX/trend, spread, R:R, daily-loss, drawdown, cooldown, position-count, duplicate-position, portfolio-risk, and configured margin limits. It uses the broker minimum volume. A current signal, valid SL/TP, fresh quote, verified account permissions, sufficient Pepperstone margin, and MT5 order approval are still mandatory. Automatic trading remains unchanged.</span></div>
+        <div class="override-safety"><strong>Hard risk limits remain enforced</strong><span>You may override the model direction/confidence and technical signal timing, including its cooldown. You cannot override spread, net R:R, daily-loss, configured drawdown, position-count, duplicate-position, portfolio-risk, or margin limits. Broker minimum volume must fit the same balance/equity risk budget. A current signal, valid SL/TP, fresh quote, verified account permissions and MT5 order approval remain mandatory.</span></div>
       </div>
       <footer class="modal-footer"><button class="button secondary" type="button" data-close-dialog="rejected-dialog">Cancel</button><button id="open-rejected-btn" class="button danger" type="submit">Force open at broker minimum</button></footer>
     </form>

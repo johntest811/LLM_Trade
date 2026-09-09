@@ -120,7 +120,7 @@ class RiskSizingTests(unittest.TestCase):
     def test_minimum_lot_is_rejected_instead_of_rounded_up(self, info, tick, calc):
         info.return_value, tick.return_value, calc.side_effect = self.info, self.tick, self._profit
         lot, reason, sizing = self.manager._compute_lot_size(
-            self.decision, {"balance": 15.0}, None, "TEST", []
+            self.decision, {"balance": 15.0, "equity": 15.0}, None, "TEST", []
         )
         self.assertIsNone(lot)
         self.assertIn("Minimum Lot Risk", reason)
@@ -133,7 +133,7 @@ class RiskSizingTests(unittest.TestCase):
         info.return_value, tick.return_value, calc.side_effect = self.info, self.tick, self._profit
         decision = dict(self.decision, stop_loss=99.5, take_profit=101.0)
         lot, reason, sizing = self.manager._compute_lot_size(
-            decision, {"balance": 1000.0}, None, "TEST", []
+            decision, {"balance": 1000.0, "equity": 1000.0}, None, "TEST", []
         )
         self.assertEqual(reason, "")
         self.assertEqual(lot, 0.01)
@@ -150,10 +150,11 @@ class RiskSizingTests(unittest.TestCase):
             risk_percent=10.0,
             auto_close_loss_enabled=True,
             auto_close_loss_usd=2.00,
+            max_daily_loss_pct=0.0,  # Isolate the configured per-entry budget.
         )
         with patch("risk.manager.settings", configured):
             lot, reason, sizing = self.manager._compute_lot_size(
-                self.decision, {"balance": 15.17}, None, "TEST", []
+                self.decision, {"balance": 15.17, "equity": 15.17}, None, "TEST", []
             )
 
         self.assertEqual(reason, "")
@@ -161,6 +162,20 @@ class RiskSizingTests(unittest.TestCase):
         # The $2 emergency ceiling must not replace the tighter configured
         # 10% account-risk budget on a micro balance.
         self.assertAlmostEqual(sizing["risk_budget_usd"], 1.517)
+
+    @patch("risk.manager.mt5.order_calc_profit")
+    @patch("risk.manager.mt5.symbol_info_tick")
+    @patch("risk.manager.mt5.symbol_info")
+    def test_loss_streak_floor_never_increases_a_smaller_configured_cap(self, info, tick, calc):
+        info.return_value, tick.return_value, calc.side_effect = self.info, self.tick, self._profit
+        configured = replace(settings, risk_percent=.01, auto_close_loss_enabled=False, loss_streak_pause_hours=24)
+        decision = dict(self.decision, stop_loss=99.5, take_profit=101.0, _strategy={"mode": "LOCAL_REVERSAL"})
+        with patch("risk.manager.settings", configured):
+            lot, reason, sizing = self.manager._compute_lot_size(
+                decision, {"balance": 10000.0, "equity": 10000.0}, None, "TEST", [], losing_streak=2)
+        self.assertIsNotNone(lot, reason)
+        self.assertAlmostEqual(sizing["risk_budget_usd"], 1.0)
+        self.assertLessEqual(sizing["risk_usd"], 1.0)
 
     @patch("risk.manager.mt5.order_calc_profit")
     @patch("risk.manager.mt5.symbol_info_tick")
@@ -173,12 +188,13 @@ class RiskSizingTests(unittest.TestCase):
             auto_close_loss_enabled=False,
             auto_close_loss_usd=0.0,
             loss_streak_pause_hours=24,
+            max_daily_loss_pct=0.0,  # Daily capacity is tested separately.
         )
         decision = dict(self.decision, stop_loss=99.5)
         with patch("risk.manager.settings", configured):
             auto_lot, _, _ = self.manager._compute_lot_size(
                 decision,
-                {"balance": 15.0},
+                {"balance": 15.0, "equity": 15.0},
                 None,
                 "TEST",
                 [],
@@ -186,7 +202,7 @@ class RiskSizingTests(unittest.TestCase):
             )
             manual_lot, reason, sizing = self.manager._compute_lot_size(
                 decision,
-                {"balance": 15.0},
+                {"balance": 15.0, "equity": 15.0},
                 None,
                 "TEST",
                 [],
@@ -216,12 +232,13 @@ class RiskSizingTests(unittest.TestCase):
             auto_close_loss_enabled=False,
             auto_close_loss_usd=0.0,
             loss_streak_pause_hours=0,
+            max_daily_loss_pct=0.0,
         )
         decision = dict(self.decision, stop_loss=99.5)
         with patch("risk.manager.settings", configured):
             lot, reason, sizing = self.manager._compute_lot_size(
                 decision,
-                {"balance": 10.0},
+                {"balance": 10.0, "equity": 10.0},
                 None,
                 "TEST",
                 [],
@@ -235,7 +252,7 @@ class RiskSizingTests(unittest.TestCase):
     @patch("risk.manager.mt5.order_calc_profit")
     @patch("risk.manager.mt5.symbol_info_tick")
     @patch("risk.manager.mt5.symbol_info")
-    def test_force_minimum_lot_can_exceed_project_risk_budget(self, info, tick, calc):
+    def test_force_minimum_lot_cannot_exceed_project_risk_budget(self, info, tick, calc):
         info.return_value, tick.return_value, calc.side_effect = self.info, self.tick, self._profit
         configured = replace(
             settings,
@@ -246,7 +263,7 @@ class RiskSizingTests(unittest.TestCase):
         with patch("risk.manager.settings", configured):
             lot, reason, sizing = self.manager._compute_lot_size(
                 self.decision,
-                {"balance": 15.0},
+                {"balance": 15.0, "equity": 15.0},
                 None,
                 "TEST",
                 [],
@@ -254,10 +271,8 @@ class RiskSizingTests(unittest.TestCase):
                 enforce_profit_objective=False,
             )
 
-        self.assertEqual(reason, "")
-        self.assertEqual(lot, 0.01)
-        self.assertAlmostEqual(sizing["risk_usd"], 1.0)
-        self.assertGreaterEqual(sizing["risk_budget_usd"], 1.05)
+        self.assertIsNone(lot)
+        self.assertIn("Minimum Lot Risk", reason)
 
     @patch("risk.manager.mt5.order_calc_margin", return_value=3.54)
     @patch("risk.manager.mt5.symbol_info_tick")
@@ -318,7 +333,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
                 "risk_usd": 0.60,
                 "reward_usd": 0.75,
                 "risk_pct": 4.0,
-                "rr": 1.25,
+                "rr": 1.8,
                 "risk_budget_usd": 0.90,
             },
         ))
@@ -331,7 +346,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
             symbol="USDJPY",
             action="BUY",
             decision={"action": "BUY", "stop_loss": 149.9, "take_profit": 150.2},
-            account_info={"balance": 15.0},
+            account_info={"balance": 15.0, "equity": 15.0},
             open_positions=[],
             market_snapshot=object(),
             trade_history=[],
@@ -339,7 +354,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
 
         self.assertTrue(result.approved, result.reason)
         self.assertEqual(result.adjusted_lot, 0.01)
-        self.assertEqual(result.planned_rr, 1.25)
+        self.assertEqual(result.planned_rr, 1.8)
         self.assertFalse(
             manager._compute_lot_size.call_args.kwargs["apply_streak_scaling"]
         )
@@ -350,7 +365,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
             manager._compute_lot_size.call_args.kwargs["enforce_profit_objective"]
         )
 
-    def test_manual_override_bypasses_daily_loss_and_drawdown_locks(self):
+    def test_manual_override_preserves_daily_loss_and_drawdown_locks(self):
         manager = self._manager_with_hard_checks(
             (False, "REJECTED [Daily Loss Limit]: locked")
         )
@@ -363,15 +378,15 @@ class ManualOverrideRiskTests(unittest.TestCase):
             symbol="USDJPY",
             action="BUY",
             decision={"action": "BUY", "stop_loss": 149.9, "take_profit": 150.2},
-            account_info={"balance": 15.0},
+            account_info={"balance": 15.0, "equity": 15.0},
             open_positions=[],
             market_snapshot=object(),
             trade_history=[],
         )
 
-        self.assertTrue(result.approved, result.reason)
-        manager._check_daily_loss.assert_not_called()
-        manager._check_drawdown.assert_not_called()
+        self.assertFalse(result.approved)
+        self.assertIn("Daily Loss Limit", result.reason)
+        manager._check_daily_loss.assert_called_once()
 
     def test_manual_override_bypasses_loss_cooldown_only(self):
         manager = self._manager_with_hard_checks()
@@ -384,7 +399,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
             symbol="USDCAD",
             action="SELL",
             decision={"action": "SELL", "stop_loss": 1.404, "take_profit": 1.401},
-            account_info={"balance": 15.0},
+            account_info={"balance": 15.0, "equity": 15.0},
             open_positions=[],
             market_snapshot=object(),
             trade_history=[],
@@ -393,7 +408,7 @@ class ManualOverrideRiskTests(unittest.TestCase):
         self.assertTrue(result.approved, result.reason)
         manager._check_loss_cooldown.assert_not_called()
 
-    def test_manual_override_does_not_call_any_project_policy_gate(self):
+    def test_manual_override_stops_at_the_first_hard_policy_failure(self):
         manager = self._manager_with_hard_checks()
         policy_checks = (
             "_check_weekend",
@@ -416,15 +431,15 @@ class ManualOverrideRiskTests(unittest.TestCase):
             symbol="CADJPY",
             action="BUY",
             decision={"action": "BUY", "stop_loss": 115.8, "take_profit": 116.2},
-            account_info={"balance": 13.25},
+            account_info={"balance": 13.25, "equity": 13.25},
             open_positions=[{"symbol": "CADJPY"}],
             market_snapshot=object(),
             trade_history=[{"net_profit": -1.0}] * 4,
         )
 
-        self.assertTrue(result.approved, result.reason)
-        for name in policy_checks:
-            getattr(manager, name).assert_not_called()
+        self.assertFalse(result.approved)
+        self.assertIn("_check_spread", result.reason)
+        manager._compute_lot_size.assert_not_called()
 
 
 class DrawdownEntryLockTests(unittest.TestCase):

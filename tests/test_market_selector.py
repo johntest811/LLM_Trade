@@ -328,7 +328,9 @@ class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
         engine.db = database
         base_analysis = {
             "timestamp": "2026-08-12 05:10:00+00:00",
-            "indicators": {"adx_14": 30.0, "adx_delta": 1.0},
+            "indicators": {"adx_14": 30.0, "adx_delta": 1.0, "current_price": 100.0,
+                           "atr_14": 1.0, "ema_9": 100.1, "ema_21": 100.0,
+                           "rsi_14": 55.0, "macd": {"diff": .1}},
             "market_structure": {
                 "trend": "BULLISH",
                 "trend_state": "CONFIRMED_BULLISH",
@@ -344,7 +346,7 @@ class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
             patch("core.engine.annotate_range_reversion"),
             patch(
                 "core.engine.DeterministicTradePlanner.assess_capital_fit",
-                side_effect=lambda *args: {
+                side_effect=lambda *args, **kwargs: {
                     "capital_fit": True,
                     "broker_open": True,
                     "spread_value": 1.0,
@@ -361,6 +363,7 @@ class AdaptiveMarketRefreshTests(unittest.IsolatedAsyncioTestCase):
                     "type": "BOS",
                     "direction": "BULLISH",
                     "time": "2026-08-12 05:10:00+00:00",
+                    "level": 99.5,
                 }
             ]
             with_trigger = await engine._assess_market_candidate(

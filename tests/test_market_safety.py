@@ -91,10 +91,10 @@ class DownsideRiskTests(unittest.TestCase):
     @patch("risk.manager.mt5.order_calc_profit", return_value=5.0)
     def test_profitable_protected_stop_adds_no_portfolio_downside(self, _calc):
         with patch(
-            "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0)
+            "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0, max_daily_loss_usd=0.0, max_daily_loss_pct=0.0)
         ):
             ok, reason = self.manager._check_portfolio_risk(
-                {"balance": 100.0}, [self.position], proposed_risk_usd=2.0
+                {"balance": 100.0, "equity": 100.0}, [self.position], proposed_risk_usd=2.0
             )
 
         self.assertTrue(ok, reason)
@@ -103,10 +103,10 @@ class DownsideRiskTests(unittest.TestCase):
     @patch("risk.manager.mt5.order_calc_profit", return_value=-2.0)
     def test_losing_stop_is_included_in_portfolio_downside(self, _calc):
         with patch(
-            "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0)
+            "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0, max_daily_loss_usd=0.0, max_daily_loss_pct=0.0)
         ):
             ok, reason = self.manager._check_portfolio_risk(
-                {"balance": 100.0}, [self.position], proposed_risk_usd=2.0
+                {"balance": 100.0, "equity": 100.0}, [self.position], proposed_risk_usd=2.0
             )
 
         self.assertFalse(ok)
@@ -118,7 +118,7 @@ class DownsideRiskTests(unittest.TestCase):
             "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0)
         ):
             ok, reason = self.manager._check_portfolio_risk(
-                {"balance": 100.0}, [self.position], proposed_risk_usd=1.0
+                {"balance": 100.0, "equity": 100.0}, [self.position], proposed_risk_usd=1.0
             )
 
         self.assertFalse(ok)
@@ -130,7 +130,7 @@ class DownsideRiskTests(unittest.TestCase):
             "risk.manager.settings", SimpleNamespace(max_portfolio_risk_pct=3.0)
         ):
             ok, reason = self.manager._check_portfolio_risk(
-                {"balance": 100.0}, [self.position], proposed_risk_usd=1.0
+                {"balance": 100.0, "equity": 100.0}, [self.position], proposed_risk_usd=1.0
             )
 
         self.assertFalse(ok)
@@ -197,7 +197,7 @@ class DailyLossStatusTests(unittest.TestCase):
             max_daily_loss_pct=6.0,
         )
         with patch("risk.manager.settings", fake_settings):
-            ok, detail = manager.daily_loss_status({"balance": 15.0})
+            ok, detail = manager.daily_loss_status({"balance": 15.0, "equity": 15.0})
 
         self.assertFalse(ok)
         self.assertIn("$0.91 / $0.90", detail)

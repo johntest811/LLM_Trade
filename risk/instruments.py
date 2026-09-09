@@ -44,6 +44,23 @@ def is_crypto_symbol(symbol: str, info: Any = None) -> bool:
     return bool(_CRYPTO_PAIR_PATTERN.search(upper))
 
 
+def instrument_asset_class(symbol: str, info: Any = None) -> str:
+    """Classify from broker metadata, never a hard-coded market calendar."""
+    path = str(getattr(info, "path", "") or "").lower()
+    if is_crypto_symbol(symbol, info):
+        return "CRYPTO"
+    for categories, label in (
+        (("etf",), "ETF/CFD"),
+        (("stock", "share", "equit"), "STOCK/CFD"),
+        (("indice", "index"), "INDEX/CFD"),
+        (("metal",), "METAL/CFD"),
+        (("commodit", "energ"), "COMMODITY/CFD"),
+    ):
+        if any(category in path for category in categories):
+            return label
+    return "FX/CFD"
+
+
 def validate_symbol_trade_mode(info: Any, action: str) -> Tuple[bool, str]:
     """Check whether the broker currently permits a new order direction."""
     side = str(action or "").strip().upper()
@@ -127,7 +144,7 @@ def spread_metrics(symbol: str, info: Any, tick: Any) -> Dict[str, float | str]:
         "bps": bps,
         "value": bps if crypto else pips,
         "unit": "bps" if crypto else "pips",
-        "asset_class": "CRYPTO" if crypto else "FX/CFD",
+        "asset_class": instrument_asset_class(symbol, info),
     }
 
 

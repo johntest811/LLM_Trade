@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import re
 from typing import Any, Iterable, Mapping, Tuple
+from core.live_reversal import qualify_live_reversal
 
 
 TIMEFRAMES: Tuple[str, ...] = ("M1", "M5", "M15", "H1", "H4")
@@ -87,6 +88,9 @@ def build_evidence_ids(analyses: Mapping[str, Mapping[str, Any]]) -> Tuple[str, 
             if breakout_direction in breakout and "BREAKOUT" in breakout:
                 identifiers.append(f"{timeframe}_BREAKOUT_{breakout_direction}")
 
+    reversal = qualify_live_reversal(analyses)
+    if reversal["eligible"]:
+        identifiers.append(reversal["evidence_id"])
     return tuple(dict.fromkeys(identifiers))
 
 
@@ -194,7 +198,7 @@ def has_directional_m5_trigger(evidence_ids: Iterable[str], action: str) -> bool
     return has_directional_trigger(
         evidence_ids, action, timeframes=("M5",)
     ) or any(
-        str(identifier).startswith(f"M5_RANGE_{direction}_")
+        str(identifier).startswith((f"M5_RANGE_{direction}_", f"M5_LOCAL_REVERSAL_{direction}_"))
         for identifier in evidence_ids
     )
 

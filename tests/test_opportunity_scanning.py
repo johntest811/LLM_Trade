@@ -35,12 +35,14 @@ def analysis(timeframe, *, direction="BULLISH", range_setup=False):
             "atr_14": 1.0, "atr_14_pips": 10.0,
             "adx_14": 14.0 if range_setup else 30.0,
             "adx_delta": -0.2 if range_setup else 0.5,
-            "rsi_14": 32.0 if range_setup else 55.0,
+            "rsi_14": 32.0 if range_setup else (55.0 if direction == "BULLISH" else 45.0),
             "candle_body_atr_signed": 0.2, "candle_return_atr": 0.2,
             "candle_range_atr": 0.8, "opening_gap_atr": 0.0,
             "stochastic": {"k": 18.0 if range_setup else 60.0, "d": 18.0 if range_setup else 60.0},
             "bollinger_bands": {"lower": 99.0, "middle": 100.0, "upper": 101.0, "width_pct": 0.2},
-            "macd": {"diff": 0.0}, "ema_9": 99.2, "ema_21": 99.4,
+            "macd": {"diff": 0.0 if range_setup else (.1 if direction == "BULLISH" else -.1)},
+            "ema_9": 99.2 if range_setup else (100.1 if direction == "BULLISH" else 99.8),
+            "ema_21": 99.4 if range_setup else 100.0,
         },
         "market_structure": {
             "trend": direction, "trend_state_direction": direction,
@@ -58,6 +60,7 @@ def frames_with_bos(direction="BULLISH"):
     frames = {tf: analysis(tf, direction=direction) for tf in ("M5", "M15", "H1", "H4")}
     frames["M5"]["market_structure"]["structure_events"] = [{
         "type": "BOS", "direction": direction, "time": frames["M5"]["timestamp"],
+        "level": 99.5 if direction == "BULLISH" else 100.5,
     }]
     return frames
 
@@ -221,7 +224,7 @@ class OpportunityScreenTests(unittest.TestCase):
         frames["M5"]["indicators"].update(rsi_14=75.0, stochastic={"k": 99.0, "d": 99.0})
         result = screen_opportunities(frames, {"capital_fit": True})
         self.assertFalse(result["model_eligible"])
-        self.assertIn("BOS Breakout Exhaustion", result["opportunity_rejections"]["BUY"])
+        self.assertIn("Continuation Confirmation", result["opportunity_rejections"]["BUY"])
 
     def test_qualified_failed_thesis_mode_is_considered_without_lowering_final_confidence(self):
         with (
@@ -346,8 +349,8 @@ class AnalysisContractTests(unittest.TestCase):
         current = analyzer.analyze("SpotCrude", "M5", frame)
         previous = analyzer.analyze("SpotCrude", "M5", frame.iloc[:-1])
         self.assertAlmostEqual(current["indicators"]["atr_14_pips"], current["indicators"]["atr_14"] / 0.1, places=3)
-        self.assertIs(analyzer.analyze("SpotCrude", "M5", frame), current)
-        self.assertIs(analyzer.analyze("SpotCrude", "M5", frame.iloc[:-1]), previous)
+        self.assertEqual(analyzer.analyze("SpotCrude", "M5", frame), current)
+        self.assertEqual(analyzer.analyze("SpotCrude", "M5", frame.iloc[:-1]), previous)
 
 
 if __name__ == "__main__":

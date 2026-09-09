@@ -180,6 +180,15 @@ class AppConfig:
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]
 
+    # Observation only: never grants live entry authority or relaxes risk gates.
+    reversal_watch_enabled: bool = _bool("REVERSAL_WATCH_ENABLED", True)
+    # Explicit opt-in only. The separate live contract keeps fixed extra caps.
+    live_reversal_enabled: bool = _bool("LIVE_REVERSAL_ENABLED", False)
+    continuation_entry_guard_enabled: bool = _bool("CONTINUATION_ENTRY_GUARD_ENABLED", True)
+    continuation_min_clearance_atr: float = max(
+        0.0, min(0.5, float(os.getenv("CONTINUATION_MIN_CLEARANCE_ATR", "0.15")))
+    )
+
     # MT5 account / terminal
     mt5_account: int | None = int(os.getenv("MT5_ACCOUNT")) if os.getenv("MT5_ACCOUNT") else None
     mt5_password: str = os.getenv("MT5_PASSWORD", "")
@@ -453,6 +462,32 @@ class AppConfig:
     retest_min_resumption_atr: float = max(
         0.01, float(os.getenv("RETEST_MIN_RESUMPTION_ATR", "0.10"))
     )
+    # Price-based pullbacks need not flip the slow EMA regime label. These
+    # bounds use completed bars and ATR, never a symbol, calendar year or price.
+    price_pullback_enabled: bool = _bool("PRICE_PULLBACK_ENABLED", True)
+    price_pullback_lookback_bars: int = max(
+        3, min(12, int(os.getenv("PRICE_PULLBACK_LOOKBACK_BARS", "6")))
+    )
+    price_pullback_max_resumption_bars: int = max(
+        1, min(3, int(os.getenv("PRICE_PULLBACK_MAX_RESUMPTION_BARS", "3")))
+    )
+    price_pullback_min_depth_atr: float = max(
+        0.05, float(os.getenv("PRICE_PULLBACK_MIN_DEPTH_ATR", "0.20"))
+    )
+    price_pullback_max_depth_atr: float = max(
+        price_pullback_min_depth_atr,
+        float(os.getenv("PRICE_PULLBACK_MAX_DEPTH_ATR", "1.50")),
+    )
+    price_pullback_break_buffer_atr: float = max(
+        0.01, float(os.getenv("PRICE_PULLBACK_BREAK_BUFFER_ATR", "0.05"))
+    )
+    price_pullback_max_resumption_atr: float = max(
+        retest_min_resumption_atr,
+        float(os.getenv("PRICE_PULLBACK_MAX_RESUMPTION_ATR", "0.85")),
+    )
+    scan_audit_enabled: bool = _bool("SCAN_AUDIT_ENABLED", True)
+    scan_audit_retention_days: int = max(1, int(os.getenv("SCAN_AUDIT_RETENTION_DAYS", "30")))
+    scan_audit_max_rows: int = max(1000, int(os.getenv("SCAN_AUDIT_MAX_ROWS", "100000")))
     shadow_symbols: List[str] = field(
         default_factory=lambda: _csv("SHADOW_SYMBOLS", "")
     )

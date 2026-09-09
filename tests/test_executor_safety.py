@@ -24,7 +24,7 @@ class ExecutorSafetyTests(unittest.TestCase):
                 self.executor._validate_lot("TEST", 0.035),
             )
 
-    def test_operator_override_bypasses_spread_policy_but_requires_fresh_quote(self):
+    def test_operator_override_cannot_bypass_spread_policy(self):
         info = SimpleNamespace(digits=5)
         tick = SimpleNamespace(time=time.time(), bid=1.0, ask=1.1)
         override_settings = SimpleNamespace(
@@ -54,8 +54,9 @@ class ExecutorSafetyTests(unittest.TestCase):
                 True,
             )
 
-        self.assertTrue(result.success, result.error)
-        spread.assert_not_called()
+        self.assertFalse(result.success)
+        self.assertIn("too wide", result.error)
+        spread.assert_called_once()
 
     def test_operator_override_cannot_open_a_close_only_market(self):
         info = SimpleNamespace(

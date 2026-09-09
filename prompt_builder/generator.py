@@ -259,6 +259,14 @@ class PromptGenerator:
         retest = ms.get("retest_continuation")
         retest_str = (
             (
+                f"{retest.get('direction')} PRICE_PULLBACK_RESUMPTION; "
+                f"closed through {retest.get('break_level')} after "
+                f"{retest.get('bars_since_pullback')} bar(s); "
+                f"depth={retest.get('pullback_depth_atr')} ATR"
+            )
+            if isinstance(retest, dict) and retest.get("kind") == "PRICE_PULLBACK_RESUMPTION"
+            else
+            (
                 f"{retest.get('direction')} after "
                 f"{retest.get('previous_state')} -> {retest.get('current_state')}; "
                 f"resumption={retest.get('resumption_atr')} ATR"
@@ -288,7 +296,7 @@ class PromptGenerator:
         
         m5_triggers = [
             eid for eid in evidence_ids
-            if eid.startswith(("M5_BOS_", "M5_CHOCH_", "M5_BREAKOUT_", "M5_RETEST_", "M5_RANGE_"))
+            if eid.startswith(("M5_BOS_", "M5_CHOCH_", "M5_BREAKOUT_", "M5_RETEST_", "M5_RANGE_", "M5_LOCAL_REVERSAL_"))
         ]
         if m5_triggers:
             m5_trigger_text = f"AVAILABLE ({m5_triggers})"
@@ -296,6 +304,15 @@ class PromptGenerator:
             m5_trigger_text = "NONE (No M5 BOS, CHoCH, breakout, retest, or range ID. YOU MUST CHOOSE HOLD with evidence_ids=[])"
         entry_actions = permitted_entry_actions(evidence_ids)
         entry_contract = ", ".join(entry_actions) if entry_actions else "HOLD ONLY"
+        local_reversal_rule = ""
+        if any(eid.startswith("M5_LOCAL_REVERSAL_") for eid in evidence_ids):
+            local_reversal_rule = (
+                "A supplied M5_LOCAL_REVERSAL ID is a separately qualified experimental reversal: "
+                "M5/M15 agree, H1/H4 oppose, and momentum is rising. It is an explicit exception "
+                "to the ordinary H4 continuation and CHoCH/BOS rules below, not macro alignment. "
+                "Cite this exact ID only if you independently confirm its direction; otherwise HOLD. "
+                "Final risk requires confidence >= 0.85; never inflate confidence to pass."
+            )
 
         # Compress FVG array
         fvgs = ms.get("fair_value_gaps", [])
@@ -381,6 +398,7 @@ Choose a permitted BUY or SELL only when its M5 Entry Trigger ID is AVAILABLE an
 IF M5 Entry Triggers Status is NONE, OUTPUT HOLD WITH evidence_ids=[].
 An M5_RETEST ID with M15/H1 alignment is a valid fresh entry trigger when momentum agrees. A trend label by itself is context, not an entry trigger.
 An early reversal requires matching M5 and M15 direction plus CHoCH or a momentum-confirmed breakout.
+{local_reversal_rule}
 A supplied M5_RANGE ID is the sole low-ADX exception. Choose only the direction encoded by that ID, or HOLD.
 {counter_h4_rule}
 When broker-derived FX context is reliable, do not trade against its pair bias.

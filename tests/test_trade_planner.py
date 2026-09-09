@@ -43,6 +43,8 @@ def _planner_settings():
         max_spread_pips=3.0,
         max_crypto_spread_bps=30.0,
         risk_percent=1.0,
+        max_daily_loss_usd=0.0,
+        max_daily_loss_pct=0.0,
         auto_close_loss_enabled=False,
         auto_close_loss_usd=0.25,
         max_margin_usage_pct=35.0,

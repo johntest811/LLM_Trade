@@ -3,8 +3,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app_config.settings import settings
+from app_config.settings import settings as runtime_settings
 from risk.manager import RiskManager
+
+# Isolate the pre-existing structure/exhaustion gates here. The default-on
+# continuation guard is tested with complete fixtures in test_continuation_quality.py.
+settings = replace(runtime_settings, continuation_entry_guard_enabled=False)
 
 
 def _analysis(
@@ -56,6 +60,11 @@ def _analysis(
 
 
 class EntryStructureGateTests(unittest.TestCase):
+    def setUp(self):
+        context = patch("risk.manager.settings", settings)
+        context.start()
+        self.addCleanup(context.stop)
+
     def test_confirmed_aligned_trend_without_fresh_trigger_is_rejected(self):
         analyses = [_analysis(tf) for tf in ("M5", "M15", "H1", "H4")]
 

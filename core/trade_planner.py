@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 from mt5.safe_api import mt5
 
 from app_config.settings import settings
+from risk.budget import risk_capital, entry_risk_budget
+from core.live_reversal import live_reversal_plan, live_reversal_risk_percent
 from mt5.timebase import broker_tick_age_seconds
 from risk.execution_costs import estimate_execution_risk
 from risk.instruments import (
@@ -280,13 +282,31 @@ class DeterministicTradePlanner:
         )
 
         structure = (analysis or {}).get("market_structure", {})
+        reversal_setup = live_reversal_plan(analysis, action, config=settings)
+        reversal_matches = bool(reversal_setup)
+        if reversal_matches:
+            try:
+                invalidation = float(reversal_setup["invalidation_price"])
+                reversal_target = float(reversal_setup["target_price"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return TradePlan(False, action, reason="Validated live reversal levels are unavailable")
+            if (not all(math.isfinite(value) and value > 0 for value in (invalidation, reversal_target))
+                    or (action == "BUY" and not invalidation < entry < reversal_target)
+                    or (action == "SELL" and not reversal_target < entry < invalidation)):
+                return TradePlan(False, action, reason="Live quote has left the validated reversal entry zone")
+            # This separate strategy uses its two-candle invalidation, not the
+            # ordinary continuation's ATR stop. Never shrink broker/spread floors.
+            risk_distance = max(abs(entry - invalidation), 0.5 * atr,
+                                broker_min * 1.20,
+                                spread_abs * (100.0 / max(settings.max_spread_to_stop_pct, 1e-9)))
         range_setup = structure.get("range_reversion", {}) or {}
         range_matches = bool(
-            isinstance(range_setup, dict)
+            not reversal_matches
+            and isinstance(range_setup, dict)
             and range_setup.get("eligible")
             and str(range_setup.get("direction", "")).upper() == action
         )
-        if range_matches:
+        if range_matches and not reversal_matches:
             try:
                 invalidation = float(range_setup.get("invalidation_price"))
                 range_target = float(range_setup.get("target_price"))
@@ -302,14 +322,16 @@ class DeterministicTradePlanner:
         support = float(structure.get("support") or 0.0)
         resistance = float(structure.get("resistance") or 0.0)
         source = f"{settings.plan_stop_atr:g} ATR"
+        if reversal_matches:
+            source = "validated local reversal invalidation (experimental)"
         if range_matches:
             source = "validated range invalidation"
-        if action == "BUY" and 0 < support < entry:
+        if not reversal_matches and action == "BUY" and 0 < support < entry:
             structural_distance = entry - (support - 0.20 * atr)
             if risk_distance < structural_distance <= 3.0 * atr:
                 risk_distance = structural_distance
                 source = "ATR + support invalidation"
-        elif action == "SELL" and resistance > entry:
+        elif not reversal_matches and action == "SELL" and resistance > entry:
             structural_distance = (resistance + 0.20 * atr) - entry
             if risk_distance < structural_distance <= 3.0 * atr:
                 risk_distance = structural_distance
@@ -323,6 +345,8 @@ class DeterministicTradePlanner:
             stop_loss = entry + risk_distance
             take_profit = entry - risk_distance * rr
         baseline_take_profit = take_profit
+        if reversal_matches:
+            take_profit = min(take_profit, reversal_target) if action == "BUY" else max(take_profit, reversal_target)
 
         technical_target, technical_error = DeterministicTradePlanner._technical_target(
             action,
@@ -339,7 +363,7 @@ class DeterministicTradePlanner:
         )
         if technical_target is None and require_technical_target:
             return TradePlan(False, action, reason=technical_error)
-        target_capped = False
+        target_capped = reversal_matches
         # Optional rolling structure is advisory.  The entry gate already
         # rejects orders opened too close to opposing structure, and the final
         # risk manager independently validates net R:R.  Capping every BOS or
@@ -350,7 +374,7 @@ class DeterministicTradePlanner:
         # technical target.
         constrain_to_technical_target = bool(
             technical_target is not None
-            and (require_technical_target or range_matches)
+            and (require_technical_target or range_matches or reversal_matches)
         )
         if constrain_to_technical_target:
             capped_take_profit = (
@@ -358,7 +382,7 @@ class DeterministicTradePlanner:
                 if action == "BUY"
                 else max(take_profit, technical_target)
             )
-            target_capped = not math.isclose(
+            target_capped = target_capped or not math.isclose(
                 capped_take_profit,
                 take_profit,
                 rel_tol=0.0,
@@ -442,22 +466,28 @@ class DeterministicTradePlanner:
         symbol: str,
         analysis: Dict[str, Any],
         account: Dict[str, Any],
+        *, daily_loss: float = 0.0,
     ) -> Dict[str, Any]:
         """Assess both directions at broker minimum volume without sending."""
         info = mt5.symbol_info(symbol)
         tick = mt5.symbol_info_tick(symbol)
-        balance = float(account.get("balance", 0.0) or 0.0)
-        equity = float(account.get("equity", balance) or balance)
-        current_margin = float(account.get("margin", 0.0) or 0.0)
-        risk_budget = balance * settings.risk_percent / 100.0
-        if settings.auto_close_loss_enabled and settings.auto_close_loss_usd > 0:
-            risk_budget = min(risk_budget, settings.auto_close_loss_usd)
+        capital = risk_capital(account)
+        balance = float(account["balance"]) if capital > 0 else 0.0
+        equity = float(account["equity"]) if capital > 0 else 0.0
+        try:
+            current_margin = float(account.get("margin", 0.0))
+            free_margin = float(account["margin_free"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            current_margin = free_margin = math.nan
+        risk_budget = entry_risk_budget(account, settings, daily_loss=daily_loss)
         result: Dict[str, Any] = {
             "symbol": symbol,
             "status": "DATA ERROR",
             "capital_fit": False,
             "reason": "Broker metadata is unavailable",
             "risk_budget_usd": round(risk_budget, 4),
+            "risk_capital": capital,
+            "risk_basis": "MIN_BALANCE_EQUITY",
             "min_volume": 0.0,
             "min_stop_risk_usd": 0.0,
             "min_price_stop_risk_usd": 0.0,
@@ -474,6 +504,9 @@ class DeterministicTradePlanner:
             "directions": {},
         }
         if info is None or tick is None or balance <= 0 or equity <= 0:
+            return result
+        if not all(math.isfinite(v) and v >= 0 for v in (current_margin, free_margin)):
+            result["reason"] = "Valid finite account margin is required"
             return result
 
         raw_tick_time = getattr(tick, "time", None)
@@ -498,8 +531,13 @@ class DeterministicTradePlanner:
         candidates = []
         diagnostics = []
         for action in ("BUY", "SELL"):
+            direction_budget = risk_budget
+            if live_reversal_plan(analysis, action, config=settings):
+                direction_budget = entry_risk_budget(account, settings,
+                    risk_percent=live_reversal_risk_percent(settings), daily_loss=daily_loss)
             plan = cls.build(symbol, action, analysis, info=info, tick=tick)
-            direction: Dict[str, Any] = {"plan": plan.to_dict(), "capital_fit": False}
+            direction: Dict[str, Any] = {"plan": plan.to_dict(), "capital_fit": False,
+                                         "risk_budget_usd": round(direction_budget, 4)}
             if plan.entry > 0 and plan.stop_loss > 0:
                 order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
                 estimate = estimate_execution_risk(
@@ -518,10 +556,10 @@ class DeterministicTradePlanner:
                 fit = (
                     plan.valid
                     and risk > 0
-                    and risk <= risk_budget + 1e-9
+                    and risk <= direction_budget + 1e-9
                     and margin > 0
                     and projected_margin_pct <= settings.max_margin_usage_pct + 1e-9
-                    and float(account.get("margin_free", 0.0) or 0.0) >= margin * 1.05
+                    and free_margin >= margin * 1.05
                 )
                 direction.update(
                     capital_fit=fit,
@@ -577,11 +615,11 @@ class DeterministicTradePlanner:
         if fit_any:
             result["status"] = "CAPITAL FIT"
             result["reason"] = "At least one direction fits risk and projected margin limits"
-        elif valid and min(item["risk_usd"] for item in valid) > risk_budget + 1e-9:
+        elif valid and all(item["risk_usd"] > item["risk_budget_usd"] + 1e-9 for item in valid):
             result["status"] = "UNAFFORDABLE"
             result["reason"] = (
                 f"Minimum-volume technical stop risks ${result['min_stop_risk_usd']:.2f}; "
-                f"budget is ${risk_budget:.2f}"
+                "exceeds its direction-specific risk budget"
             )
         elif valid:
             result["status"] = "MARGIN BLOCK"
@@ -593,7 +631,14 @@ class DeterministicTradePlanner:
                 if str(direction.get("plan", {}).get("reason", "")).strip()
             ))
             if not result["broker_open"]:
-                result["status"] = "MARKET CLOSED"
+                # A stale tick does not prove a closed trading session,
+                # particularly for the broker's extended-hours instruments.
+                result["status"] = (
+                    "TRADING DISABLED" if trade_mode == 0 else
+                    "CLOSE ONLY" if trade_mode == 3 else
+                    "QUOTE STALE" if tick_age > settings.max_tick_age_seconds else
+                    "QUOTE UNAVAILABLE"
+                )
                 result["reason"] = (
                     plan_reasons[0]
                     if plan_reasons

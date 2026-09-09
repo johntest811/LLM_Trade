@@ -20,6 +20,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app_config.settings import settings
+from core.live_reversal import (
+    LIVE_REVERSAL_VERSION, LIVE_REVERSAL_MIN_CONFIDENCE,
+    LIVE_REVERSAL_MAX_RISK_PERCENT, LIVE_REVERSAL_MAX_AGE_SECONDS,
+)
 from ui.state import dashboard_state
 from utils.system_monitor import get_system_metrics
 from utils.instance_lock import InstanceLock
@@ -324,10 +328,57 @@ async def get_live():
         })
 
 
+@app.get("/api/scans")
+async def get_scan_audit(symbol: str = "", limit: int = 50, before_id: int | None = None):
+    """Read the active account's discovery/prefilter history; never submit orders."""
+    engine = getattr(app.state, "engine", None)
+    account = getattr(engine, "_active_account_identity", None)
+    if engine is None or not account:
+        return JSONResponse({"error": "Active account is unavailable"}, status_code=503)
+    if len(symbol) > 100 or not 1 <= limit <= 200 or (before_id is not None and before_id <= 0):
+        return JSONResponse({"error": "Use a symbol up to 100 characters, limit 1–200, and a positive before_id"}, status_code=422)
+    try:
+        args = (engine._account_scope(account), symbol.strip(), limit)
+        if before_id is not None:
+            args += (before_id,)
+        rows = await asyncio.to_thread(engine.replay_logger.get_scan_observations, *args)
+        # Do not return the previous account's history after an account switch.
+        if getattr(engine, "_active_account_identity", None) != account:
+            return JSONResponse({"error": "Active account changed; retry the read"}, status_code=409)
+        return {"observations": rows, "retention_days": settings.scan_audit_retention_days,
+                "max_rows": settings.scan_audit_max_rows,
+                "next_before_id": rows[-1].get("id") if len(rows) == limit else None}
+    except Exception:
+        logger.exception("Scan audit read failed")
+        return JSONResponse({"error": "Scan history is temporarily unavailable"}, status_code=503)
+
+
 @app.get("/api/config")
 async def get_config():
     return {
         "config_fingerprint": settings.config_fingerprint,
+        "reversal_watch_enabled": settings.reversal_watch_enabled,
+        "reversal_watch_live_enabled": settings.live_reversal_enabled,
+        "live_reversal_enabled": settings.live_reversal_enabled,
+        "risk_basis": "MIN_BALANCE_EQUITY",
+        "manual_hard_risk_limits_enforced": True,
+        "continuation_entry_guard_enabled": settings.continuation_entry_guard_enabled,
+        "continuation_min_clearance_atr": settings.continuation_min_clearance_atr,
+        "live_reversal_strategy_version": LIVE_REVERSAL_VERSION,
+        "live_reversal_min_confidence": LIVE_REVERSAL_MIN_CONFIDENCE,
+        "live_reversal_max_risk_percent": LIVE_REVERSAL_MAX_RISK_PERCENT,
+        "live_reversal_max_age_seconds": LIVE_REVERSAL_MAX_AGE_SECONDS,
+        "live_reversal_validation_status": "EXPERIMENTAL - profitability unvalidated",
+        "price_pullback_enabled": settings.price_pullback_enabled,
+        "price_pullback_lookback_bars": settings.price_pullback_lookback_bars,
+        "price_pullback_max_resumption_bars": settings.price_pullback_max_resumption_bars,
+        "price_pullback_min_depth_atr": settings.price_pullback_min_depth_atr,
+        "price_pullback_max_depth_atr": settings.price_pullback_max_depth_atr,
+        "price_pullback_break_buffer_atr": settings.price_pullback_break_buffer_atr,
+        "price_pullback_max_resumption_atr": settings.price_pullback_max_resumption_atr,
+        "scan_audit_enabled": settings.scan_audit_enabled,
+        "scan_audit_retention_days": settings.scan_audit_retention_days,
+        "scan_audit_max_rows": settings.scan_audit_max_rows,
         "symbols": settings.trading_symbols,
         "dynamic_market_selection_enabled": settings.dynamic_market_selection_enabled,
         "market_candidate_symbols": settings.market_candidate_symbols,

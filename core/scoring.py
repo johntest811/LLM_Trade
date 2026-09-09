@@ -6,14 +6,32 @@ structure, risk, and news. Combines them into an Overall Trade Quality Score
 and evaluates confluence across 13 variables to protect capital on micro accounts.
 """
 import logging
+import math
 import re
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 
 from app_config.settings import settings
+from core.live_reversal import qualify_live_reversal
 from risk.instruments import analysis_atr_price, analysis_is_crypto, analysis_pip_size
 
 logger = logging.getLogger("TradingSystem.ScoringEngine")
+
+
+def order_block_proximity(action, analysis, block):
+    """A price-relative percentage is not a cross-market proximity measure."""
+    try:
+        expected = "BULLISH" if action == "BUY" else "BEARISH"
+        if block.get("type") != expected:
+            return False
+        price = float(analysis["indicators"]["current_price"])
+        atr = float(analysis_atr_price(analysis))
+        low, high = float(block["low"]), float(block["high"])
+        if not all(math.isfinite(v) and v > 0 for v in (price, atr, low, high)) or low > high:
+            return False
+        return low <= price <= high + .25 * atr if action == "BUY" else low - .25 * atr <= price <= high
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
+        return False
 
 
 class DecisionScoringEngine:
@@ -52,6 +70,7 @@ class DecisionScoringEngine:
         reversal = normalized_mode in {
             "CONFIRMED_REVERSAL",
             "FAILED_THESIS_REVERSAL",
+            "LOCAL_REVERSAL",
         }
         range_mode = normalized_mode == "RANGE_REVERSION"
         range_setup = struct_m5.get("range_reversion", {}) or {}
@@ -113,12 +132,8 @@ class DecisionScoringEngine:
         obs = struct_m5.get("order_blocks", [])
         factors["ob_proximity"] = False
         for ob in obs:
-            if is_buy and ob.get("type") == "BULLISH":
-                if close_price >= ob.get("low", 0.0) and close_price <= ob.get("high", 0.0) * 1.002:
-                    factors["ob_proximity"] = True
-            elif is_sell and ob.get("type") == "BEARISH":
-                if close_price <= ob.get("high", 0.0) and close_price >= ob.get("low", 0.0) * 0.998:
-                    factors["ob_proximity"] = True
+            if order_block_proximity(action, m5_analysis, ob):
+                factors["ob_proximity"] = True
 
         # 4. Fair Value Gaps (FVG)
         fvgs = struct_m5.get("fair_value_gaps", [])
@@ -372,12 +387,8 @@ class DecisionScoringEngine:
         obs = struct_m5.get("order_blocks", [])
         close_p = ind_m5.get("current_price", 0.0)
         for ob in obs:
-            if is_buy and ob.get("type") == "BULLISH":
-                if close_p >= ob.get("low", 0.0) and close_p <= ob.get("high", 0.0) * 1.002:
-                    ob_pts = 60
-            elif not is_buy and ob.get("type") == "BEARISH":
-                if close_p <= ob.get("high", 0.0) and close_p >= ob.get("low", 0.0) * 0.998:
-                    ob_pts = 60
+            if order_block_proximity(action, m5_analysis, ob):
+                ob_pts = 60
 
         liq_pts = 0
         liq = struct_m5.get("liquidity_zones", {})
@@ -417,6 +428,12 @@ class DecisionScoringEngine:
         expected_direction = "BULLISH" if is_buy else "BEARISH"
 
         struct_pts = 80 if range_matches else 20
+        local_reversal = qualify_live_reversal(dict(zip(
+            ("M5", "M15", "H1", "H4"), (m5_analysis, m15_analysis, h1_analysis, h4_analysis),
+        )), config=settings)
+        if strategy_mode == "LOCAL_REVERSAL" and local_reversal["eligible"] and local_reversal["direction"] == action:
+            # Credit the real first boundary break, without inventing macro alignment.
+            struct_pts = 40
         for ev in bos_choch:
             if str(ev.get("direction", "")).upper() != expected_direction:
                 continue

@@ -126,15 +126,29 @@ only after explicit session arming and all gates pass.
 
 ## Micro-account constraints
 
-The requested Forex bootstrap profile permits up to **10%** of current balance
-per order because Pepperstone's 0.01-lot minimum often cannot fit a conventional
-1% budget on a micro balance. The separate **$2.00** floating-loss close is only
-an emergency backstop; the broker stop plus configured execution costs must
-still fit the tighter 10% order cap before entry. This is high risk: at most two
-positions may be open, aggregate stop risk is capped at 12%, and the UTC daily
-loss ceiling remains $2.50. Broker minimum contract size,
-spread, permitted slippage, configured fees, free margin, and the portfolio cap
-still determine whether a symbol can fit.
+The explicitly authorized live micro-account profile caps an entry at **10% of
+the lower of balance and equity**, with aggregate planned stop risk capped at
+**12%**. The UTC gross daily loss limit is **$2.50**; `MAX_DAILY_LOSS_PCT=0.0`
+disables only the additional percentage daily ceiling, not the dollar stop. Remaining
+daily capacity also limits each new entry and the combined risk of open and new
+positions. Missing, non-finite or non-positive balance/equity blocks new risk.
+The separate **$2.00** floating-loss close remains an emergency backstop, not
+permission to exceed the smaller entry budget. At most two positions may open.
+
+At $17.50 balance/equity, the entry ceiling is $1.75, the portfolio ceiling is
+$2.10, and the daily ceiling is $2.50 before further limits. With $1.06 already
+recorded in UTC daily gross losses and no open positions, remaining daily
+capacity limits new planned risk to $1.44. Profit does not replenish this gross
+loss budget. This is a high-risk profile, not a recommendation or a guarantee
+of profitable trading. The conservative defaults/example remain 1% entry and
+3% portfolio/daily; do not overwrite the approved private `.env` with the example.
+Pepperstone's minimum volume may still not fit: the
+system must skip the trade, not round volume up or increase risk automatically.
+Broker minimum contract size, spread, permitted slippage, configured fees, free
+margin, and portfolio risk still determine whether a symbol can fit. Dollar
+ceilings remain upper bounds on larger accounts; they do not scale upwards
+automatically. These are modeled limits: gaps, slippage, fees and outages can
+produce larger realized losses.
 
 The decision provider never controls position risk. Its output contains
 direction, confidence, and reasoning; deterministic code applies the configured
@@ -142,10 +156,32 @@ risk envelope. This prevents any rule or model response from silently replacing
 the user's risk budget.
 
 The terminal's **Capital fit** panel recomputes affordability from current
-Pepperstone contract specifications and quotes. The controlled bootstrap cap
+Pepperstone contract specifications and quotes. The configured entry cap
 does not guarantee an order: changing volatility can still produce a red
 `UNAFFORDABLE` result, while spread, margin, daily-loss, confidence and execution
 checks can independently reject a setup.
+
+Manual confirmation can override model confidence and technical timing, but
+cannot bypass spread, minimum net R:R, duplicate/position limits, configured
+drawdown, daily-loss, portfolio or margin protections. Its minimum-size order
+must fit the same capital controls and its separate
+`MANUAL_OVERRIDE_MAX_RISK_PCT` ceiling (left at 1%; this restoration changes
+automatic-entry limits, not manual override authority). A daily-loss lock blocks new entries until
+the next UTC day (08:00 in Manila); it does not disable existing-position
+protection. Do not clear the loss history or raise limits just to force orders.
+
+Unretested trend-continuation entries require EMA, RSI and MACD agreement and
+a completed close at least `CONTINUATION_MIN_CLEARANCE_ATR=0.15` ATR beyond the
+broken structure. Verified retests retain their separate validation. Discovery,
+the deterministic fast path and final risk validation enforce this gate when
+`CONTINUATION_ENTRY_GUARD_ENABLED=true` (the default). Order-block proximity
+credit is limited to 0.25 ATR, instead of a percentage of nominal price. These
+scale-independent checks apply across instruments, but are conservative entry
+rules, not proof of a profitable strategy. They would reject the recorded AUDUSD
+entry with opposing MACD and only approximately 0.11 ATR clearance; other losses
+remain possible. Validate changes on unseen data and demo forward runs, and
+review performance and broker/platform changes periodically. No configuration
+can guarantee unattended profitability for years.
 
 The three requested forex symbols remain the core watch list. On weekdays, the
 adaptive selector ranks a bounded candidate universe by current capital fit,
@@ -275,6 +311,47 @@ This provides operational continuity, not evidence of profitability. Broker
 SL/TP remains the final protection during a local process, model, or connection
 outage.
 
+### Operating without the coding assistant
+
+With `LLM_PROVIDER=local`, this application calls your LM Studio server, not
+Codex. Its local execution does not require an active coding-assistant session.
+Keep this project, `.env`, database, MT5, Python and LM Studio available; keep
+the PC awake. Do not run multiple copies or use a different MT5 account without
+reviewing and reauthorizing it. The watchdog supervises this Python service only;
+it is not a Windows boot/login service and does not start MT5 or LM Studio.
+
+After a PC reboot: open MT5 on the intended account, start LM Studio's local
+server with the configured model loaded, then run `run_unattended.ps1` using
+the command above. Verify the dashboard at `http://127.0.0.1:8080` shows
+`READY`, `ARMED LIVE`, autonomous `ACTIVE`, and a healthy decision provider.
+Do not bypass a red readiness check. A safe model-only diagnostic is:
+
+```powershell
+python -m llm.check --model 'qwen3.5-4b@q4_k_s'
+```
+
+To apply file or `.env` changes while the watchdog is already supervising,
+wait until there are **no open positions**, then use:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/api/stop'
+```
+
+The watchdog detects the stopped engine and replaces the Python process
+after repeated checks (normally within a minute). Wait for `READY` and verified
+account-bound autonomy to return; compare `/api/config` with the intended settings.
+An active daily-loss lock can legitimately keep readiness at `DAILY_LOSS` after
+a healthy restart. Verify advancing broker/protection heartbeats and leave that
+entry lock intact; account-bound authorization does not override risk approval.
+Without a running watchdog, `/api/stop` alone does not restart the process.
+For a lasting pause, use **Disarm entries** instead: it clears persisted
+authorization while leaving position protection running. Do not kill the
+protection process to pause entries.
+
+Review trade results and logs regularly, preserve account-scoped backups, and
+retest after broker, model, dependency or configuration changes. Neither tests
+nor the watchdog establish profitability or guarantee years of fault-free operation.
+
 ## Scan cadence and observability
 
 - `ANALYSIS_INTERVAL_SECONDS=15` is a polling and retry interval, not a request
@@ -355,7 +432,7 @@ outage.
 - Multiple symbols prepare data concurrently. Deterministic evaluation has no
   network or model queue. Local model calls default to one at a time; raise
   `LLM_MAX_CONCURRENCY` only after parallel schema probes pass without extra
-  VRAM pressure. This RTX 3060 deployment is benchmarked and bounded at two.
+  VRAM pressure. Choose concurrency from measurements on the actual machine.
   The OpenAI provider also uses bounded concurrency.
 - A queued result is discarded if its analyzed M5 candle is no longer current.
 - H4 disagreement remains a rejection by default. A controlled exception is
@@ -527,6 +604,169 @@ session, missing history, spread, account size, or risk limits. Dashboard market
 cards show setup readiness, viable directions, and technical rejection reasons
 separately from affordability. These changes increase coverage and review
 efficiency, not guaranteed fills, win rate, or profitability.
+
+## Durable continuation detection and scan diagnostics
+
+Scanning a trend is not the same as approving an entry. ADX measures trend
+strength, not BUY/SELL direction ([Fidelity's indicator guide](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/DMI)).
+The detector now shares the existing bounded ADX-decline exception with
+discovery and final risk validation: a retest is no longer discarded before
+its own exception can be evaluated. The normal 0.50-point and aligned
+1.50-point decline limits have not been raised.
+
+In addition to exact trend-label transitions, `PRICE_PULLBACK_ENABLED=true`
+recognizes an actual completed-M5 counter-move without requiring the slow EMA
+regime to flip. Within a six-bar lookback it requires:
+
+- M5/M15/H1/H4 directional agreement, fast-EMA/RSI agreement, and the usual
+  ADX strength checks; a declining ADX also needs the aligned exception.
+- A 0.20–1.50 ATR pullback and the first completed close through its anchored
+  high/low plus a 0.05 ATR buffer, within three bars of the counter-move.
+- A directional body of at least 0.10 ATR, resumption no larger than 0.85 ATR,
+  a small opening gap, and the existing candle-range limit.
+- Contiguous, finite, completed candles. Session gaps, duplicated/future bars,
+  stale frames and already-consumed close-breaks cannot create a new signal.
+
+This emits the existing timestamped `M5_RETEST_*` evidence through the same
+discovery, model, validation and risk paths. Outer-band overextension,
+opposing zones, confidence, costs, margin, SL/TP, daily losses, position sizing
+and re-entry protections remain unchanged. It does not force an entry into
+every falling/rising market or rescue every historical rejection.
+
+All `PRICE_PULLBACK_*` values are configurable in `.env` and exposed by
+`GET /api/config`; process restart is required. The feature contains no
+calendar-year or instrument-name exceptions. Multi-year/price-scale unit
+regressions test invariant behavior, **not multi-year profitability**. Review
+cost-inclusive forward/demo results across changing market conditions before
+making further strategy changes; no fixed strategy is guaranteed indefinitely.
+
+`GET /api/scans?symbol=EURJPY&limit=50` now returns the active account's
+persisted discovery and pre-model entry observations. They include UTC time,
+completed bar, configuration fingerprint, selection/model eligibility,
+recognized evidence, ADX and technical rejection reasons. Identical observations
+are deduplicated in memory, and writes are batched outside the broker thread.
+Audit failures are logged and retried without granting trade permission.
+`SCAN_AUDIT_RETENTION_DAYS=30` and `SCAN_AUDIT_MAX_ROWS=100000` bound this new
+diagnostic table; older scan observations expire automatically. Existing trade,
+model-decision, broker and shadow-outcome records are not pruned by this feature.
+
+Market Watch distinguishes `HISTORY STALE`, `HISTORY UNAVAILABLE`, and
+`QUOTE STALE`. Stale data alone is not claimed to prove a closed session;
+the Python MT5 interface does not provide the MQL5 session-window functions.
+Missing quotes/ADX display dashes or `NOT ANALYZED`, and missing/stale spreads
+do not receive a green health indicator. Broker contract metadata identifies
+stock, ETF and index CFDs. Trade freshness checks remain strict.
+
+## Reversal research, corrected history, and forward validation
+
+`REVERSAL_WATCH_ENABLED=true` adds a **research-only** countertrend watch to
+both discovery and completed-M5 entry scans. It does not loosen ADX, confidence,
+entry evidence, risk, or loss limits. The first fixed hypothesis,
+`m5-countertrend-watch-v1`, requires six contiguous completed M5 candles,
+two directional closes, a first close through the preceding four-bar boundary
+with a 0.05 ATR buffer, fast EMA/RSI agreement, and at least two opposing
+M15/H1/H4 directions. Body, range, gap and invalidation distances are bounded
+in ATR units. Forming/stale confirmations and invalid OHLC are rejected.
+It observes a narrow local-reversal pattern, not every intrabar rally or fall.
+Change the strategy version if these hypothesis rules change.
+
+Watch candidates appear as `BUY/SELL reversal watch — RESEARCH ONLY` on the
+dashboard and expire from the display after five minutes. They have
+`live_eligible=false`. The research observation itself is not live authority.
+With the separate opt-in below disabled, it cannot alter the evidence catalog,
+LLM prompt or order flow. The original entry paths continue independently.
+
+### Opt-in live reversal pilot (experimental, not profitability-validated)
+
+`LIVE_REVERSAL_ENABLED=true` explicitly enables `m5-m15-local-reversal-v1`.
+The default/example remains `false`. This is a narrower live subset of the
+research watch, **not automatic promotion based on an offline score**:
+
+- Fresh contiguous completed M5 research trigger, with M5 and completed M15
+  direction agreement against both H1 and H4; valid, aligned UTC candle times.
+- M5 ADX at least 25 (or the higher configured entry floor), M15 ADX at least
+  its existing confirmation floor, and finite, non-falling M5 ADX.
+- A canonical `M5_LOCAL_REVERSAL_*` evidence ID. The local model must confirm
+  it with at least 85% reported confidence; this number is **not a calibrated
+  win probability**. The deterministic fast path does not supply this decision.
+- Signal age no more than 120 seconds after M5 close, rechecked following
+  inference and immediately before submission. Existing execution-drift,
+  spread, opposing-zone, quality and confluence checks still apply.
+- A deterministic two-candle invalidation stop, at least 0.5 ATR away and
+  respecting broker/spread floors. The target cannot exceed the research
+  objective or nearer known opposing structure. Insufficient net R:R rejects.
+- Maximum configured risk for this path is **min(RISK_PERCENT, 2%)**, further
+  limited by existing dollar/streak/daily/portfolio controls. With the authorized
+  10% ordinary-entry profile and $17.50 balance/equity, this experimental path
+  still has a 2% ceiling ($0.35). Its separate strategy cap was not increased. If minimum
+  volume plus modeled costs exceeds the budget, no
+  trade is allowed. Gaps/slippage can still produce larger realized losses.
+- No rejected-trade manual bypass is offered for this path. All account-bound
+  arming, daily-loss, margin, duplicate and broker order checks remain active.
+
+Discovery and `/api/scans` expose a separate `live_reversal` record. The dashboard
+labels it `LIVE CANDIDATE - not approved`, not an executed trade; the label
+expires after two minutes. `/api/config` reports the opt-in and experimental
+status. Setting `LIVE_REVERSAL_ENABLED=false` and restarting removes only this
+entry path; research observation and ordinary trade protection remain available.
+
+The analysis cache now fingerprints candle content and relevant contract
+metadata, not just the final timestamp. Broker corrections/backfills therefore
+invalidate cached indicators. Callers receive isolated results, and an LRU
+bound of 2,048 symbol/timeframe keys (each with at most one previous-candle
+result) prevents unbounded cache growth during broker-wide discovery.
+
+Scan records include `research_watch`, missing directional trigger reasons,
+and a hashed account-scope identifier. Archive `/api/scans` periodically before
+the configured retention expires. For older pages use
+`/api/scans?symbol=EURJPY&limit=200&before_id=<next_before_id>`; stop when
+`next_before_id` is null. Concatenate page observations into one JSON object's
+`observations` array. These reads are account-scoped and never place orders.
+An account switch during a read returns HTTP 409 instead of the old history.
+
+The following **offline forward-audit tool** accepts that saved JSON and an M1
+BID-price CSV with columns `time,open,high,low,close` (optional `symbol`). Times
+must be ascending, unique **UTC minute opens**, not unconverted broker time.
+Use recorded broker data for the same exact contract. Cost arguments are
+mandatory: spread and adverse per-fill slippage in raw price units, plus
+round-trip commission as a fraction of initial risk value. The numbers below
+are illustrative test inputs, not Pepperstone cost estimates:
+
+```powershell
+python -m core.research_validation --scans eurjpy-scans.json --bars eurjpy-m1-utc.csv --symbol EURJPY --spread-price 0.016 --slippage-price 0.003 --commission-r 0.02
+```
+
+It prints a JSON report and never writes to the trading database, changes
+settings, contacts MT5/LM Studio, or submits orders. It records input SHA-256
+hashes and runs baseline and double-cost stress scenarios. It:
+
+- Simulates entry at the first M1 open available **after observation**, not
+  retroactively at the signal candle's close; rejects stale signals and large
+  entry drift. Buy entries use ASK and sell exits use ASK under the explicit
+  constant-spread assumption.
+- Uses only completed M1 candles, charges adverse slippage and commission,
+  allows stop gaps to lose more than 1 R, and assumes stop first if both levels
+  are touched within one OHLC bar.
+- Counts data gaps/unresolved trades and rejects invalid OHLC. Deduplicates
+  repeat observations and prevents overlapping hypothetical positions per
+  account/configuration/version/symbol. Different versions/accounts are never
+  pooled into one performance claim.
+- Reports net R, expectancy, profit factor, drawdown, BUY/SELL and yearly
+  breakdowns, and three chronological time folds. Cross-boundary trades are
+  purged from fold metrics. Fewer than 20 resolved trades in any fold is
+  `INSUFFICIENT DATA`; unresolved coverage prevents a positive evidence label.
+  Even positive, sufficiently populated folds are only `POSITIVE SIMULATION ONLY`.
+
+This is **not** a complete market-history backtester or a reproduction of the
+live bot's profit exits, position sizing, swaps or portfolio/margin constraints.
+It audits the fixed reference stop/target of recorded research observations;
+it does not fit parameters or retroactively invent missed observations. It is
+not a claim that the latest EURJPY screenshot qualifies. No automatic promotion
+to live trading exists, and passing software tests is not a profitability test.
+Independent out-of-sample/demo evidence across market conditions is still
+needed before treating the opt-in live pilot as a validated strategy. Forward-period testing and execution
+delay simulation are described in the
+[official MT5 testing documentation](https://www.metatrader5.com/en/terminal/help/algotrading/strategy_optimization).
 
 ## Before considering live arming
 

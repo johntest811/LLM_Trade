@@ -22,6 +22,8 @@ def _reserve_settings(**overrides):
         "cfd_round_turn_cost_usd_per_lot": 0.0,
         "fixed_execution_cost_usd": 0.0,
         "risk_percent": 1.0,
+        "max_daily_loss_usd": 0.0,
+        "max_daily_loss_pct": 0.0,
         "auto_close_loss_enabled": False,
         "auto_close_loss_usd": 0.0,
         "auto_close_profit_enabled": False,
@@ -88,7 +90,7 @@ class ExecutionReserveTests(unittest.TestCase):
             patch("risk.manager.mt5.order_calc_profit", side_effect=_profit),
         ):
             lot, reason, sizing = manager._compute_lot_size(
-                decision, {"balance": 100.0}, None, "EURUSD", []
+                decision, {"balance": 100.0, "equity": 100.0}, None, "EURUSD", []
             )
 
         self.assertEqual(reason, "")

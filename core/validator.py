@@ -102,7 +102,7 @@ class DecisionValidator:
                     False,
                     parsed,
                     f"{action} requires a supplied directional M5 BOS, CHoCH, "
-                    "breakout, pullback-retest, or validated range evidence ID.",
+                    "breakout, pullback-retest, validated range or qualified local-reversal evidence ID.",
                 )
             if action in {"BUY", "SELL"}:
                 bounded_actions = tuple(

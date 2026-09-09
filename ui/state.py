@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timezone
 from typing import Any, Dict, List, Optional
+from risk.budget import risk_capital
 
 
 @dataclass
@@ -210,7 +211,7 @@ class SymbolPrice:
     ask: float
     spread_pips: float
     trend: str = "—"
-    adx: float = 0.0
+    adx: Optional[float] = None
     spread_value: float = 0.0
     spread_unit: str = "pips"
     asset_class: str = "FX/CFD"
@@ -326,9 +327,10 @@ class DashboardState:
             self.account.open_pl = round(total_open_pl, 2)
             self.account.daily_pl = round(self._realized_today + total_open_pl, 2)
             self.account.portfolio_risk_usd = round(sum(p.risk_to_sl_usd for p in live), 2)
+            capital = risk_capital({"balance": self.account.balance, "equity": self.account.equity})
             self.account.portfolio_risk_pct = round(
-                self.account.portfolio_risk_usd / self.account.balance * 100.0, 2
-            ) if self.account.balance else 0.0
+                self.account.portfolio_risk_usd / capital * 100.0, 2
+            ) if capital else 0.0
 
     def add_closed_trade(self, trade: Dict[str, Any]) -> None:
         with self._lock:
@@ -451,7 +453,7 @@ class DashboardState:
             a.strategy_evidence = "NEGATIVE/INCONCLUSIVE EVIDENCE"
 
     def update_prices(self, symbol: str, bid: float, ask: float,
-                      point: float, trend: str = "—", adx: float = 0.0) -> None:
+                      point: float, trend: str = "—", adx: Optional[float] = None) -> None:
         if any(c in symbol.upper() for c in ["ETH", "LTC", "BTC"]):
             pip_multi = 1.0
         elif "XRP" in symbol.upper():

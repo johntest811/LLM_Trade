@@ -43,6 +43,8 @@ class PromptTemplateBuilder:
                 "trigger; it is not permission to invent a retest. "
                 "A supplied M5_RANGE ID is a deterministic low-ADX outer-band reversal; "
                 "choose only its encoded direction and never invent range eligibility. "
+                "A supplied M5_LOCAL_REVERSAL ID permits only its encoded M5/M15-confirmed "
+                "direction against H1/H4; acknowledge the macro conflict or choose HOLD. "
                 "Deterministic code calculates broker-valid entry, stop, target and volume after your "
                 "directional decision. Never invent price levels. Trade management must describe only "
                 "which supplied directional evidence would invalidate the setup. Otherwise choose HOLD."

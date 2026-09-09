@@ -7,6 +7,7 @@ Sends real-time updates to the global dashboard state.
 """
 import asyncio
 import copy
+import json
 import logging
 import math
 import threading
@@ -23,7 +24,9 @@ from core.analysis_engine import MarketAnalysisEngine
 from core.forex_context import build_currency_context
 from core.market_selector import AdaptiveMarketSelector
 from core.market_universe import discovery_batch, tradable_symbols
-from core.opportunities import screen_opportunities
+from core.opportunities import classify_reversal_watch, screen_opportunities
+from core.continuation_quality import continuation_entry_check
+from core.live_reversal import qualify_live_reversal
 from core.profit_retention import RetentionState, advance_retention
 from core.entry_retest import annotate_retest_continuation
 from core.entry_momentum import aligned_structure_allows_adx_decline
@@ -332,8 +335,14 @@ class TradingEngine:
             if adjacent:
                 previous = await asyncio.to_thread(self.analyzer.analyze, symbol, "M5", m5_frame.iloc[:-1])
         previous_state = (previous or {}).get("market_structure", {}).get("trend_state", "NEUTRAL")
-        annotate_retest_continuation(analyses["M5"], analyses["M15"], analyses["H1"], {"M5": previous_state})
+        annotate_retest_continuation(
+            analyses["M5"], analyses["M15"], analyses["H1"],
+            {"M5": previous_state}, completed_bars=m5_frame,
+            h4_analysis=analyses["H4"],
+        )
         annotate_range_reversion(analyses["M5"], analyses["M15"], analyses["H1"], analyses["H4"])
+        analyses["M5"]["market_structure"]["reversal_watch"] = classify_reversal_watch(analyses, m5_frame)
+        analyses["M5"]["market_structure"]["live_reversal"] = qualify_live_reversal(analyses)
         return analyses
 
     def _symbols_with_position_priority(
@@ -440,9 +449,15 @@ class TradingEngine:
         if frame is None or frame.empty or bool(frame.attrs.get("is_stale", False)):
             result = {
                 "symbol": symbol,
-                "status": "DATA UNAVAILABLE",
+                "status": "HISTORY STALE" if frame is not None and not frame.empty else "HISTORY UNAVAILABLE",
                 "capital_fit": False,
-                "reason": "Current completed M5 history is unavailable or stale",
+                "reason": (
+                    "No recent completed M5 candle; session may be closed or history has stopped updating"
+                    if frame is not None and not frame.empty else
+                    "MT5 did not return usable M5 history"
+                ),
+                "opportunity_bar": str(frame.attrs.get("latest_bar_utc", "")) if frame is not None else "",
+                "asset_class": frame.attrs.get("asset_class", "FX/CFD") if frame is not None else "FX/CFD",
                 "selection_score": 0.0,
                 "selection_regime": "UNKNOWN",
                 "selected": False,
@@ -468,6 +483,7 @@ class TradingEngine:
             symbol,
             analysis,
             account,
+            daily_loss=getattr(getattr(self, "risk", None), "daily_loss_usd", math.inf),
         )
         history = await self.db.get_closed_positions(
             symbol=mt5.broker_symbol_name(symbol),
@@ -493,6 +509,12 @@ class TradingEngine:
             analyses["M15"], analyses["H1"],
         )
         capital_fit["entry_prefilter_reason"] = prefilter_reason
+        capital_fit["evidence_ids"] = list(build_evidence_ids(analyses))
+        capital_fit["confirmation_directions"] = {
+            tf: item.get("market_structure", {}).get("trend_state_direction", "NEUTRAL")
+            for tf, item in analyses.items()
+        }
+        capital_fit["retest_continuation"] = analysis.get("market_structure", {}).get("retest_continuation")
         capital_fit["model_eligible"] = bool(
             capital_fit.get("model_eligible")
             and not prefilter_reason
@@ -627,6 +649,10 @@ class TradingEngine:
             dashboard_state.update_market_fit(str(item.get("symbol", "")), item)
             self._market_rankings[str(item.get("symbol", "")).upper()] = dict(item)
 
+        await self._record_scan_audit(sorted_ranked, "DISCOVERY", account)
+        active_identity = getattr(self, "_active_account_identity", None)
+        if active_identity is not None and not self._same_account(account, active_identity):
+            return
         previous = self._selected_symbols
         self._selected_symbols = tuple(selected)
         self._market_selection_initialized = True
@@ -634,6 +660,48 @@ class TradingEngine:
         if previous != self._selected_symbols:
             summary = ", ".join(selected) if selected else "none currently eligible"
             self.log(f"Adaptive market selection: {summary}.")
+
+    async def _record_scan_audit(
+        self, observations: List[Dict[str, Any]], lane: str, account: Dict[str, Any]
+    ) -> None:
+        """Persist meaningful per-bar/selection changes, not every tick or refresh."""
+        writer = getattr(getattr(self, "replay_logger", None), "log_scan_observations", None)
+        if not settings.scan_audit_enabled or not callable(writer):
+            return
+        scope = self._account_scope(account)
+        if getattr(self, "_scan_audit_scope", None) != scope:
+            self._scan_audit_scope = scope
+            self._scan_audit_signatures = {}
+        fields = (
+            "symbol", "opportunity_bar", "status", "reason", "capital_fit",
+            "broker_open", "selected", "model_selected", "opportunity_status",
+            "model_eligible", "entry_prefilter_reason", "viable_entry_actions",
+            "opportunity_rejections", "evidence_ids", "confirmation_directions",
+            "retest_continuation", "selection_adx", "selection_adx_delta",
+            "research_watch", "live_reversal", "missing_entry_reasons",
+        )
+        pending, signatures = [], {}
+        for row in observations:
+            snapshot = {key: row[key] for key in fields if key in row}
+            try:
+                signature = json.dumps(snapshot, sort_keys=True, allow_nan=False, default=str)
+            except (TypeError, ValueError):
+                continue
+            key = (str(row.get("symbol", "")).upper(), lane)
+            if key[0] and self._scan_audit_signatures.get(key) != signature:
+                pending.append(snapshot)
+                signatures[key] = signature
+        if not pending:
+            return
+        try:
+            saved = await asyncio.to_thread(writer, scope, lane, pending)
+        except Exception as exc:
+            logger.warning("Scan-audit recording failed: %s", exc)
+            saved = False
+        if saved and getattr(self, "_scan_audit_scope", None) == scope:
+            self._scan_audit_signatures.update(signatures)
+            while len(self._scan_audit_signatures) > 10000:
+                self._scan_audit_signatures.pop(next(iter(self._scan_audit_signatures)))
 
     def _decision_work_is_active(self) -> bool:
         """Return whether entry/exit analysis currently has queue priority."""
@@ -1298,6 +1366,9 @@ class TradingEngine:
             return None
 
         result = dict(decision)
+        if settings.continuation_entry_guard_enabled and str((result.get("_strategy") or {}).get("mode", "")) == "TREND_CONTINUATION":
+            if not continuation_entry_check(action, analyses["M5"], min_clearance_atr=settings.continuation_min_clearance_atr)[0]:
+                return None
         result["_decision_path"] = "DETERMINISTIC_FAST_PATH"
         return result
 
@@ -3940,7 +4011,7 @@ class TradingEngine:
                             # Retrieve trend from current dashboard state instead of recalculating
                             existing_price = dashboard_state.prices.get(symbol)
                             temp_trend = existing_price.trend if existing_price else "NEUTRAL"
-                            adx_val = existing_price.adx if existing_price else 25.0
+                            adx_val = existing_price.adx if existing_price else None
                                     
                             dashboard_state.update_prices(
                                 symbol=symbol,
@@ -4842,6 +4913,7 @@ class TradingEngine:
             symbol,
             m5_analysis,
             account_info,
+            daily_loss=getattr(getattr(self, "risk", None), "daily_loss_usd", math.inf),
         )
         cached_rank = self._market_rankings.get(symbol.upper(), {})
         if cached_rank:
@@ -4927,6 +4999,23 @@ class TradingEngine:
                 h1_analysis,
             )
             opportunity = screen_opportunities(decision_analyses, capital_fit, history)
+            if entry_contract and not opportunity["viable_entry_actions"] and not prefilter_reason:
+                prefilter_reason = "; ".join(dict.fromkeys(opportunity["opportunity_rejections"].values())) or "No direction passed deterministic entry screening."
+            await self._record_scan_audit([{
+                "symbol": symbol, "opportunity_bar": completed_bar,
+                "status": "PREFILTERED" if prefilter_reason else (
+                    "ENTRY EVIDENCE" if entry_contract else "NO ENTRY EVIDENCE"
+                ),
+                "reason": prefilter_reason or "Completed-M5 evidence checked before model admission",
+                "evidence_ids": list(allowed_evidence_ids),
+                "viable_entry_actions": opportunity.get("viable_entry_actions", []),
+                "opportunity_rejections": opportunity.get("opportunity_rejections", {}),
+                "research_watch": opportunity.get("research_watch", {}),
+                "live_reversal": opportunity.get("live_reversal", {}),
+                "missing_entry_reasons": opportunity.get("missing_entry_reasons", {}),
+                "selection_adx": m5_analysis.get("indicators", {}).get("adx_14"),
+                "selection_adx_delta": m5_analysis.get("indicators", {}).get("adx_delta"),
+            }], "ENTRY", account_info)
             capital_fit.update(opportunity)
             capital_fit["entry_prefilter_reason"] = prefilter_reason
             capital_fit["model_eligible"] = bool(opportunity["model_eligible"] and not prefilter_reason)
@@ -4964,6 +5053,9 @@ class TradingEngine:
                     "available. The local-model lane remains free for markets "
                     "that can produce a valid BUY or SELL decision."
                 )
+                watch = opportunity.get("research_watch") or {}
+                if watch.get("candidate"):
+                    reason += " " + str(watch.get("reason", "Research-only reversal observed."))
                 dashboard_state.update_symbol_decision(
                     symbol,
                     stage="NO ENTRY EVIDENCE",
@@ -5296,6 +5388,12 @@ class TradingEngine:
         plan = None
         manual_candidate = None
         if action in {"BUY", "SELL"}:
+            live_reversal = qualify_live_reversal(decision_analyses)
+            if live_reversal["eligible"] and live_reversal["direction"] == action:
+                decision["_strategy"] = {
+                    "mode": "LOCAL_REVERSAL", "source": "DETERMINISTIC_LIVE_REVERSAL",
+                    "version": live_reversal["strategy_version"],
+                }
             plan = await asyncio.to_thread(
                 DeterministicTradePlanner.build, symbol, action, m5_analysis
             )
@@ -5320,6 +5418,9 @@ class TradingEngine:
                     "quality_score": 0.0,
                     "confluence_score": 0.0,
                 }
+                if live_reversal["eligible"] and live_reversal["direction"] == action:
+                    # Experimental entries never offer a manual direction override.
+                    manual_candidate = None
         dashboard_state.update_llm(
             action=action,
             symbol=symbol,
@@ -5777,6 +5878,13 @@ class TradingEngine:
                     gate_reason=decision_age_reason,
                 )
                 return
+            if str((decision.get("_strategy") or {}).get("mode", "")) == "LOCAL_REVERSAL":
+                fresh_reversal = qualify_live_reversal(decision_analyses, now=datetime.now(timezone.utc))
+                if not fresh_reversal["eligible"] or fresh_reversal["direction"] != action:
+                    dashboard_state.update_symbol_decision(
+                        symbol, stage="DECISION EXPIRED", gate_reason=fresh_reversal["reason"]
+                    )
+                    return
             res = await self.executor.open_trade(
                 symbol=symbol,
                 action=action,
